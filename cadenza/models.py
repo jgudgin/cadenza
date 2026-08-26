@@ -1,0 +1,132 @@
+"""The whole engine's state lives here, in Postgres. Nothing about a run is
+held in process memory between steps - the same rule cadence is built on,
+extended from a status column to a dependency graph.
+"""
+
+from __future__ import annotations
+
+import enum
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class RunStatus(str, enum.Enum):
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+    needs_review = "needs_review"
+
+
+class TaskStatus(str, enum.Enum):
+    pending = "pending"      # exists, but waiting on dependencies or backoff
+    running = "running"      # claimed by a worker right now
+    completed = "completed"
+    failed = "failed"        # exhausted retries, or Permanent
+    dropped = "dropped"      # planner decided it's no longer needed
+    blocked = "blocked"      # a dependency failed; this can never become ready
+
+
+class WorkflowRun(Base):
+    __tablename__ = "cadenza_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    goal: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default=RunStatus.running.value)
+    # The shared blackboard: accumulated facts every agent and planner can
+    # read. Deliberately different from cadence, where steps share nothing -
+    # here the tasks in one run are collaborating on one artifact, not
+    # processing independent items, so shared context is the point rather
+    # than the thing being avoided.
+    context: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    tasks: Mapped[list["Task"]] = relationship(back_populates="run")
+
+
+class Task(Base):
+    __tablename__ = "cadenza_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("cadenza_runs.id"))
+    type: Mapped[str] = mapped_column(String(100))  # registry key
+    status: Mapped[str] = mapped_column(String(20), default=TaskStatus.pending.value)
+    input: Mapped[dict] = mapped_column(JSONB, default=dict)
+    output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Which task's planning decision produced this one, and why. This is
+    # the audit trail that answers "why did the system decide to do this?"
+    created_by_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("cadenza_tasks.id"), nullable=True
+    )
+    reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    run: Mapped[WorkflowRun] = relationship(back_populates="tasks")
+    dependencies: Mapped[list["TaskDependency"]] = relationship(
+        foreign_keys="TaskDependency.task_id", back_populates="task"
+    )
+
+
+class TaskDependency(Base):
+    """task_id cannot become ready until depends_on_task_id is completed.
+
+    A real join table rather than a JSON array of ids: it gets referential
+    integrity for free, and lets the readiness query below be a plain
+    NOT EXISTS rather than an unindexed array scan.
+    """
+
+    __tablename__ = "cadenza_task_dependencies"
+    __table_args__ = (UniqueConstraint("task_id", "depends_on_task_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("cadenza_tasks.id"))
+    depends_on_task_id: Mapped[int] = mapped_column(ForeignKey("cadenza_tasks.id"))
+
+    task: Mapped[Task] = relationship(foreign_keys=[task_id], back_populates="dependencies")
+
+
+class Event(Base):
+    """Append-only trace of everything the orchestrator did and decided.
+
+    This is the observability layer: `cadenza trace <run_id>` reads nothing
+    but this table. Every dispatch, every planner decision (with its
+    reasoning), every failure is one row here, in order.
+    """
+
+    __tablename__ = "cadenza_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("cadenza_runs.id"))
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("cadenza_tasks.id"), nullable=True)
+    type: Mapped[str] = mapped_column(String(50))
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
