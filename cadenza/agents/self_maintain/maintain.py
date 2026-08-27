@@ -57,9 +57,13 @@ async def self_maintain(ctx: AgentContext) -> dict:
     if not result["tests_passed"] or not result["changed_files"]:
         return result
 
-    await asyncio.to_thread(workspace.ensure_label, REPO_PATH, LABEL, description="Opened by the self-maintenance agent")
-    await asyncio.to_thread(
-        workspace.commit_and_push, worktree_path, branch_name, f"self-maintain: {result['summary'][:72]}"
+    # Independent of each other - one labels the repo, the other pushes the
+    # branch - only open_pull_request below needs both done.
+    await asyncio.gather(
+        asyncio.to_thread(workspace.ensure_label, REPO_PATH, LABEL, description="Opened by the self-maintenance agent"),
+        asyncio.to_thread(
+            workspace.commit_and_push, worktree_path, branch_name, f"self-maintain: {result['summary'][:72]}"
+        ),
     )
     pr_url = await asyncio.to_thread(
         workspace.open_pull_request,

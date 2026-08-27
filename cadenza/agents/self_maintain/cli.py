@@ -32,6 +32,15 @@ app = build_cli(
 )
 
 
+def _apply_overrides(*, repo: str, max_open_prs: int, base: str) -> None:
+    if repo:
+        maintain.REPO_PATH = repo
+    if max_open_prs:
+        maintain.MAX_OPEN_PRS = max_open_prs
+    if base:
+        maintain.BASE_BRANCH = base
+
+
 @app.command()
 def run(
     task: str,
@@ -48,12 +57,7 @@ def run(
     (defaults to "main"): use it when the code being worked on only lives
     on a feature branch that hasn't reached main yet, or agents' worktrees
     won't have it at all."""
-    if repo:
-        maintain.REPO_PATH = repo
-    if max_open_prs:
-        maintain.MAX_OPEN_PRS = max_open_prs
-    if base:
-        maintain.BASE_BRANCH = base
+    _apply_overrides(repo=repo, max_open_prs=max_open_prs, base=base)
     asyncio.run(_run(task, concurrency))
 
 
@@ -87,12 +91,7 @@ def plan(
 
     --base overrides what every agent's worktree/PR is built against
     (defaults to "main") - see `run --help` for why that matters."""
-    if repo:
-        maintain.REPO_PATH = repo
-    if max_open_prs:
-        maintain.MAX_OPEN_PRS = max_open_prs
-    if base:
-        maintain.BASE_BRANCH = base
+    _apply_overrides(repo=repo, max_open_prs=max_open_prs, base=base)
     asyncio.run(_plan(rough_idea, concurrency))
 
 

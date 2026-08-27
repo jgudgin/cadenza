@@ -36,12 +36,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .exceptions import Drop, Permanent
 from .models import Event, RunStatus, Task, TaskDependency, TaskStatus, WorkflowRun
-from .registry import AgentContext, PlanOutcome, Registry, TaskSpec
+from .registry import AgentContext, AgentSpec, PlanOutcome, Registry, TaskSpec
 
 log = logging.getLogger("cadenza")
 
-_CLAIM_SQL = text(
-    """
+# Shared by both claim queries below (the held-transaction model and the
+# lease model) - same "what's ready" rule either way, only the SET clause
+# differs (the lease model also stamps an expiry). Keeping it as one string
+# means that rule can't drift out of sync between the two claim paths.
+_NEXT_TASK_CTE = """
     WITH next_task AS (
         SELECT t.id
         FROM cadenza_tasks t
@@ -58,6 +61,11 @@ _CLAIM_SQL = text(
         FOR UPDATE OF t SKIP LOCKED
         LIMIT 1
     )
+"""
+
+_CLAIM_SQL = text(
+    _NEXT_TASK_CTE
+    + """
     UPDATE cadenza_tasks
     SET status = 'running', attempts = attempts + 1, updated_at = now()
     FROM next_task
@@ -211,6 +219,77 @@ async def _apply_plan(
         )
 
 
+async def _settle_task(
+    session: AsyncSession,
+    run: WorkflowRun,
+    task: Task,
+    spec: AgentSpec,
+    *,
+    outcome_kind: str,
+    output: dict | None = None,
+    error: Exception | None = None,
+) -> None:
+    """Given a task that just finished - successfully, or with one of the
+    Drop/Permanent/retry outcomes - apply the resulting state transition.
+    Shared by `process_one`'s inline try/except and
+    `process_one_with_lease`'s split-transaction equivalent, so the two
+    execution models can't drift apart on what 'dropped', 'permanent',
+    'exhausted retries', or 'completed' actually means. Does not commit -
+    callers share one transaction boundary around this, but not always the
+    same one (this can run inside the claim's own transaction, or in a
+    fresh one opened after the handler already returned)."""
+    run_id = run.id
+
+    if outcome_kind == "drop":
+        task.status = TaskStatus.dropped.value
+        task.last_error = str(error)
+        session.add(Event(run_id=run_id, task_id=task.id, type="task_dropped", payload={"reason": str(error)}))
+        await _block_dependents(session, run_id, task.id, f"upstream task dropped: {error}")
+        return
+
+    if outcome_kind == "permanent":
+        task.status = TaskStatus.failed.value
+        task.last_error = str(error)
+        session.add(
+            Event(run_id=run_id, task_id=task.id, type="task_failed", payload={"reason": str(error), "permanent": True})
+        )
+        await _block_dependents(session, run_id, task.id, f"upstream task failed: {error}")
+        return
+
+    if outcome_kind == "retry":  # Retry, or anything unexpected - same treatment
+        if task.attempts >= spec.max_attempts:
+            task.status = TaskStatus.failed.value
+            task.last_error = f"gave up after {task.attempts} attempts: {error}"
+            log.warning("task %s (%s) gave up after %s attempts: %s", task.id, task.type, task.attempts, error)
+            session.add(
+                Event(run_id=run_id, task_id=task.id, type="task_failed", payload={"reason": str(error), "attempts": task.attempts})
+            )
+            await _block_dependents(session, run_id, task.id, f"upstream task exhausted retries: {error}")
+        else:
+            task.status = TaskStatus.pending.value
+            task.last_error = str(error)
+            task.next_attempt_at = backoff(task.attempts)
+            session.add(
+                Event(run_id=run_id, task_id=task.id, type="task_retry", payload={"reason": str(error), "attempt": task.attempts})
+            )
+        return
+
+    task.status = TaskStatus.completed.value
+    task.output = output
+    session.add(Event(run_id=run_id, task_id=task.id, type="task_completed", payload={"output": output}))
+
+    planner_input = PlannerInputData(
+        goal=run.goal,
+        run_context=run.context,
+        completed_task_type=task.type,
+        completed_task_input=task.input,
+        output=output,
+        task_id=task.id,
+    )
+    outcome = await spec.plan_next(planner_input)
+    await _apply_plan(session, run, task, outcome)
+
+
 async def process_one(
     session_factory: async_sessionmaker[AsyncSession], registry: Registry, run_id: int
 ) -> bool:
@@ -228,48 +307,13 @@ async def process_one(
         try:
             output = await spec.handler(ctx)
         except Drop as exc:
-            task.status = TaskStatus.dropped.value
-            task.last_error = str(exc)
-            session.add(Event(run_id=run_id, task_id=task.id, type="task_dropped", payload={"reason": str(exc)}))
-            await _block_dependents(session, run_id, task.id, f"upstream task dropped: {exc}")
-            await session.commit()
-            return True
+            await _settle_task(session, run, task, spec, outcome_kind="drop", error=exc)
         except Permanent as exc:
-            task.status = TaskStatus.failed.value
-            task.last_error = str(exc)
-            session.add(Event(run_id=run_id, task_id=task.id, type="task_failed", payload={"reason": str(exc), "permanent": True}))
-            await _block_dependents(session, run_id, task.id, f"upstream task failed: {exc}")
-            await session.commit()
-            return True
+            await _settle_task(session, run, task, spec, outcome_kind="permanent", error=exc)
         except Exception as exc:  # Retry, or anything unexpected - same treatment
-            if task.attempts >= spec.max_attempts:
-                task.status = TaskStatus.failed.value
-                task.last_error = f"gave up after {task.attempts} attempts: {exc}"
-                log.warning("task %s (%s) gave up after %s attempts: %s", task.id, task.type, task.attempts, exc)
-                session.add(Event(run_id=run_id, task_id=task.id, type="task_failed", payload={"reason": str(exc), "attempts": task.attempts}))
-                await _block_dependents(session, run_id, task.id, f"upstream task exhausted retries: {exc}")
-            else:
-                task.status = TaskStatus.pending.value
-                task.last_error = str(exc)
-                task.next_attempt_at = backoff(task.attempts)
-                session.add(Event(run_id=run_id, task_id=task.id, type="task_retry", payload={"reason": str(exc), "attempt": task.attempts}))
-            await session.commit()
-            return True
-
-        task.status = TaskStatus.completed.value
-        task.output = output
-        session.add(Event(run_id=run_id, task_id=task.id, type="task_completed", payload={"output": output}))
-
-        planner_input = PlannerInputData(
-            goal=run.goal,
-            run_context=run.context,
-            completed_task_type=task.type,
-            completed_task_input=task.input,
-            output=output,
-            task_id=task.id,
-        )
-        outcome = await spec.plan_next(planner_input)
-        await _apply_plan(session, run, task, outcome)
+            await _settle_task(session, run, task, spec, outcome_kind="retry", error=exc)
+        else:
+            await _settle_task(session, run, task, spec, outcome_kind="completed", output=output)
 
         await session.commit()
         return True
@@ -375,23 +419,8 @@ async def run_to_completion(
 DEFAULT_LEASE_SECONDS = 3600.0  # 1 hour; pick per task type based on the handler
 
 _CLAIM_LEASE_SQL = text(
-    """
-    WITH next_task AS (
-        SELECT t.id
-        FROM cadenza_tasks t
-        WHERE t.run_id = :run_id
-          AND t.status = 'pending'
-          AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= now())
-          AND NOT EXISTS (
-              SELECT 1
-              FROM cadenza_task_dependencies d
-              JOIN cadenza_tasks dep ON dep.id = d.depends_on_task_id
-              WHERE d.task_id = t.id AND dep.status <> 'completed'
-          )
-        ORDER BY t.created_at
-        FOR UPDATE OF t SKIP LOCKED
-        LIMIT 1
-    )
+    _NEXT_TASK_CTE
+    + """
     UPDATE cadenza_tasks
     SET status = 'running',
         attempts = attempts + 1,
@@ -472,7 +501,7 @@ async def process_one_with_lease(
     # No transaction (and no lock) held here, however long the handler
     # takes - the entire point of this model.
     error: Exception | None = None
-    outcome_kind = "output"
+    outcome_kind = "completed"
     output: dict | None = None
     try:
         output = await spec.handler(ctx)
@@ -491,74 +520,7 @@ async def process_one_with_lease(
         # task's fate immediately, so there's nothing left to lease.
         task.lease_expires_at = None
 
-        if outcome_kind == "drop":
-            task.status = TaskStatus.dropped.value
-            task.last_error = str(error)
-            session.add(Event(run_id=run_id, task_id=task.id, type="task_dropped", payload={"reason": str(error)}))
-            await _block_dependents(session, run_id, task.id, f"upstream task dropped: {error}")
-            await session.commit()
-            return True
-
-        if outcome_kind == "permanent":
-            task.status = TaskStatus.failed.value
-            task.last_error = str(error)
-            session.add(
-                Event(
-                    run_id=run_id,
-                    task_id=task.id,
-                    type="task_failed",
-                    payload={"reason": str(error), "permanent": True},
-                )
-            )
-            await _block_dependents(session, run_id, task.id, f"upstream task failed: {error}")
-            await session.commit()
-            return True
-
-        if outcome_kind == "retry":
-            if task.attempts >= spec.max_attempts:
-                task.status = TaskStatus.failed.value
-                task.last_error = f"gave up after {task.attempts} attempts: {error}"
-                log.warning(
-                    "task %s (%s) gave up after %s attempts: %s", task.id, task.type, task.attempts, error
-                )
-                session.add(
-                    Event(
-                        run_id=run_id,
-                        task_id=task.id,
-                        type="task_failed",
-                        payload={"reason": str(error), "attempts": task.attempts},
-                    )
-                )
-                await _block_dependents(session, run_id, task.id, f"upstream task exhausted retries: {error}")
-            else:
-                task.status = TaskStatus.pending.value
-                task.last_error = str(error)
-                task.next_attempt_at = backoff(task.attempts)
-                session.add(
-                    Event(
-                        run_id=run_id,
-                        task_id=task.id,
-                        type="task_retry",
-                        payload={"reason": str(error), "attempt": task.attempts},
-                    )
-                )
-            await session.commit()
-            return True
-
-        task.status = TaskStatus.completed.value
-        task.output = output
-        session.add(Event(run_id=run_id, task_id=task.id, type="task_completed", payload={"output": output}))
-
-        planner_input = PlannerInputData(
-            goal=run.goal,
-            run_context=run.context,
-            completed_task_type=task.type,
-            completed_task_input=task.input,
-            output=output,
-            task_id=task.id,
-        )
-        outcome = await spec.plan_next(planner_input)
-        await _apply_plan(session, run, task, outcome)
+        await _settle_task(session, run, task, spec, outcome_kind=outcome_kind, output=output, error=error)
 
         await session.commit()
         return True

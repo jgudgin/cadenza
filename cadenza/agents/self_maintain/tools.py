@@ -12,14 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
-from functools import lru_cache
 from typing import Any
 
-import anthropic
-
+from ...llm import MODEL, _client
 from . import workspace
 
-MODEL = "claude-sonnet-5"
 MAX_TURNS = 20
 MAX_FILE_BYTES = 200_000
 # claude-sonnet-5 emits extended-thinking content by default, and it counts
@@ -77,11 +74,6 @@ _TOOLS = [
         },
     },
 ]
-
-
-@lru_cache(maxsize=1)
-def _client() -> anthropic.AsyncAnthropic:
-    return anthropic.AsyncAnthropic()
 
 
 def _execute_tool_sync(worktree_path: str, name: str, tool_input: dict[str, Any]) -> str:
