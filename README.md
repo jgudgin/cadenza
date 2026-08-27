@@ -7,7 +7,7 @@ continues - all crash-safe in Postgres, with no in-memory state that a
 crash could lose.
 
 This repo is the engine only. It has no idea what task it's orchestrating
-- no finance code, no fixed workflow, nothing domain-specific at all. See
+- no fixed workflow, nothing domain-specific at all. See
 [`cadenza-modeler`](https://github.com/jgudgin/cadenza-modeler) for a
 complete real example built on it: a financial-modelling workflow with an
 LLM-drafted-assumptions loop, a validation step that dynamically fans out
