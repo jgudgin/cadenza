@@ -35,6 +35,14 @@ class RunSummary(BaseModel):
     status: str
 
 
+class RunListItem(BaseModel):
+    id: int
+    goal: str
+    status: str
+    created_at: str
+    updated_at: str
+
+
 def create_app(registry: Registry, *, title: str = "cadenza", engine: AsyncEngine | None = None) -> FastAPI:
     """Pass `engine` when a project is adding its own routes that need the
     same session factory (e.g. a friendlier `POST /models`) - otherwise
@@ -58,6 +66,27 @@ def create_app(registry: Registry, *, title: str = "cadenza", engine: AsyncEngin
         background.add_task(run_to_completion, session_factory, registry, run_id, concurrency=req.concurrency)
         return RunSummary(id=run_id, goal=req.goal, status="running")
 
+    @app.get("/runs", response_model=list[RunListItem])
+    async def list_runs(limit: int = 50) -> list[RunListItem]:
+        """Most-recently-updated first, so a run some task is actively
+        working on (each write bumps updated_at) naturally sorts to the
+        top - the "what's happening right now" view a dashboard wants."""
+        async with session_factory() as session:
+            result = await session.execute(
+                select(WorkflowRun).order_by(WorkflowRun.updated_at.desc()).limit(limit)
+            )
+            runs = result.scalars().all()
+        return [
+            RunListItem(
+                id=r.id,
+                goal=r.goal,
+                status=r.status,
+                created_at=r.created_at.isoformat(),
+                updated_at=r.updated_at.isoformat(),
+            )
+            for r in runs
+        ]
+
     @app.get("/runs/{run_id}", response_model=RunSummary)
     async def get_run(run_id: int) -> RunSummary:
         async with session_factory() as session:
@@ -79,6 +108,13 @@ def create_app(registry: Registry, *, title: str = "cadenza", engine: AsyncEngin
                 "attempts": t.attempts,
                 "created_by_task_id": t.created_by_task_id,
                 "last_error": t.last_error,
+                # output carries whatever an agent handler returned - a PR
+                # link, a summary, a diagnosis - the "what actually
+                # happened" a dashboard shows per task, not just its status.
+                "output": t.output,
+                "created_at": t.created_at.isoformat(),
+                "updated_at": t.updated_at.isoformat(),
+                "lease_expires_at": t.lease_expires_at.isoformat() if t.lease_expires_at else None,
             }
             for t in tasks
         ]
