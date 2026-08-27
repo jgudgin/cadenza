@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
-from .. import registry
+from .. import registry  # importing this loads .env - see cadenza/agents/__init__.py
 from ...cli import build_cli, console, print_status
 from ...db import create_tables, make_engine, make_session_factory
 from ...orchestrator import run_to_completion, start_run
