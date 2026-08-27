@@ -41,6 +41,7 @@ def create_worktree(repo_path: str, branch_name: str) -> str:
         raise ValueError(f"refusing to use {branch_name!r} as the agent's working branch")
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     worktree_path = WORKTREE_ROOT / branch_name.replace("/", "-")
+    _clear_stale_attempt(repo_path, branch_name, worktree_path)
     result = _run(
         ["git", "-C", repo_path, "worktree", "add", "-b", branch_name, str(worktree_path), "main"],
         timeout=30,
@@ -48,6 +49,23 @@ def create_worktree(repo_path: str, branch_name: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {result.stderr}")
     return str(worktree_path)
+
+
+def _clear_stale_attempt(repo_path: str, branch_name: str, worktree_path: pathlib.Path) -> None:
+    """A retried task reuses the same deterministic branch name (a slug of
+    the task plus its task id), so an earlier attempt that got as far as
+    creating the worktree before failing later on (e.g. a transient
+    network error mid coding-loop) leaves state behind that would
+    otherwise collide with the retry - `git worktree add -b` refuses to
+    reuse an existing branch name. Safe to clear unconditionally: this
+    branch is never `main`/`master` (checked by the caller) and nothing
+    reaches `commit_and_push`'s real `git push` until the coding loop has
+    already succeeded, so there is never anything here but this agent's
+    own now-abandoned attempt at this same task."""
+    if worktree_path.exists():
+        _run(["git", "-C", repo_path, "worktree", "remove", "--force", str(worktree_path)], timeout=15)
+    _run(["git", "-C", repo_path, "worktree", "prune"], timeout=15)
+    _run(["git", "-C", repo_path, "branch", "-D", branch_name], timeout=15)
 
 
 def safe_path(worktree_path: str, rel_path: str) -> pathlib.Path:

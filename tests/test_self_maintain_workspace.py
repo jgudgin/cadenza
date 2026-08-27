@@ -7,6 +7,7 @@ labels, counting) need real GitHub auth and aren't covered here.
 
 from __future__ import annotations
 
+import pathlib
 import subprocess
 
 import pytest
@@ -94,3 +95,18 @@ def test_create_worktree_and_commit_and_push_round_trip(repo):
 def test_commit_and_push_refuses_protected_branches(repo):
     with pytest.raises(ValueError):
         workspace.commit_and_push(repo, "main", "sneaky")
+
+
+def test_create_worktree_recovers_from_a_stale_earlier_attempt(repo):
+    """A retried task reuses the same deterministic branch name, so a
+    prior attempt that created the worktree/branch and then failed later
+    on (e.g. mid coding-loop) must not permanently wedge every retry."""
+    branch = "self-maintain/demo-retry"
+    first_worktree = workspace.create_worktree(repo, branch)
+    (workspace.safe_path(first_worktree, "abandoned.txt")).write_text("never committed\n")
+
+    second_worktree = workspace.create_worktree(repo, branch)
+
+    assert second_worktree == first_worktree
+    assert not (pathlib.Path(second_worktree) / "abandoned.txt").exists()
+    assert (pathlib.Path(second_worktree) / "README.md").exists()
