@@ -56,16 +56,40 @@ def test_create_worktree_refuses_protected_branches(repo):
 def test_create_worktree_base_overrides_main(repo):
     """A project developing this agent itself on a feature branch needs
     worktrees cut from that branch, not main - otherwise every agent's
-    worktree silently lacks the very code it's meant to work on."""
+    worktree silently lacks the very code it's meant to work on. Pushed to
+    origin, not just committed locally: create_worktree fetches and
+    branches off origin/{base}, precisely so a local branch pointer that's
+    behind (or, as here, a branch that only exists remotely) can't produce
+    a stale worktree - see create_worktree's own docstring for why."""
     _run(["git", "checkout", "-b", "feature"], cwd=repo)
     (pathlib.Path(repo) / "feature_only.txt").write_text("only on feature\n")
     _run(["git", "add", "feature_only.txt"], cwd=repo)
     _run(["git", "commit", "-m", "feature-only file"], cwd=repo)
+    _run(["git", "push", "-u", "origin", "feature"], cwd=repo)
     _run(["git", "checkout", "main"], cwd=repo)
 
     worktree_path = workspace.create_worktree(repo, "self-maintain/from-feature", base="feature")
 
     assert (pathlib.Path(worktree_path) / "feature_only.txt").exists()
+
+
+def test_create_worktree_uses_the_remote_branch_even_if_local_is_stale(repo):
+    """The actual bug this guards against: a long-lived local clone whose
+    `main` branch pointer never advances just because origin/main did.
+    `git fetch` alone never fast-forwards it - only checking it out (or an
+    explicit merge/reset) does - so a worktree cut from the local pointer
+    silently misses everything merged since. Simulated here without a
+    second clone: advance origin's main past what the local branch knows
+    about, then prove create_worktree still sees the new commit."""
+    (pathlib.Path(repo) / "merged_on_origin.txt").write_text("landed after this clone went stale\n")
+    _run(["git", "add", "merged_on_origin.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "simulates a PR merged elsewhere"], cwd=repo)
+    _run(["git", "push", "origin", "main"], cwd=repo)
+    _run(["git", "reset", "--hard", "HEAD~1"], cwd=repo)  # local main is now stale on purpose
+
+    worktree_path = workspace.create_worktree(repo, "self-maintain/from-stale-local", base="main")
+
+    assert (pathlib.Path(worktree_path) / "merged_on_origin.txt").exists()
 
 
 def test_safe_path_confines_to_the_worktree(tmp_path):
