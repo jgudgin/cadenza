@@ -68,5 +68,25 @@ async def test_coding_loop_reports_the_real_test_result_even_if_model_never_fini
     result = await tools.run_coding_loop(worktree_path=str(tmp_path), task="add a constant", previous_failure=None)
 
     assert result["tests_passed"] is False
-    assert result["summary"] == "(agent did not call finish)"
+    assert result["summary"] == "(model stopped without calling a tool or explaining why)"
+
+
+async def test_coding_loop_keeps_the_models_own_words_when_it_bails_without_a_tool_call(tmp_path, monkeypatch):
+    """A run that stops after one text-only turn (e.g. the model explains
+    why it isn't attempting the task) must surface that explanation, not
+    silently discard it as if nothing happened - this is what made an
+    early real run of this loop (asking it to build a lease/heartbeat
+    system) unreadable: it reported '(agent did not call finish)' with no
+    way to tell whether the model tried and failed or never engaged."""
+    responses = [
+        SimpleNamespace(content=[_block("text", text="This task is too large for a single bounded attempt.")])
+    ]
+    fake_client = _FakeClient(responses)
+    monkeypatch.setattr(tools, "_client", lambda: fake_client)
+    monkeypatch.setattr(workspace, "run_tests", lambda *a, **k: (True, "no tests ran"))
+
+    result = await tools.run_coding_loop(worktree_path=str(tmp_path), task="add a constant", previous_failure=None)
+
+    assert result["summary"] == "This task is too large for a single bounded attempt."
+    assert result["changed_files"] == []
     assert result["changed_files"] == []

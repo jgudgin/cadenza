@@ -130,7 +130,13 @@ async def run_coding_loop(*, worktree_path: str, task: str, previous_failure: st
 
         tool_uses = [b for b in response.content if b.type == "tool_use"]
         if not tool_uses:
-            break  # model stopped calling tools without calling finish - treat as done
+            # Treat as done, but keep whatever the model said instead of
+            # calling a tool - silently discarding it left a run that
+            # bailed after one text-only turn indistinguishable from one
+            # that made real progress and then stopped cleanly.
+            text = " ".join(b.text for b in response.content if b.type == "text").strip()
+            summary = text or "(model stopped without calling a tool or explaining why)"
+            break
 
         tool_results = []
         finished = False
@@ -155,7 +161,7 @@ async def run_coding_loop(*, worktree_path: str, task: str, previous_failure: st
     passed, test_output = await asyncio.to_thread(workspace.run_tests, worktree_path)
     return {
         "changed_files": sorted(changed_files),
-        "summary": summary or "(agent did not call finish)",
+        "summary": summary or f"(used all {MAX_TURNS} tool-call turns without calling finish)",
         "tests_passed": passed,
         "test_output": test_output,
     }
