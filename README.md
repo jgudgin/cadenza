@@ -59,9 +59,23 @@ duration of an LLM call means a row lock for however long that call takes
 (seconds, typically). That's fine at this scale, because different tasks
 are different rows and `SKIP LOCKED` means workers never contend over the
 *same* row - concurrency comes from parallelism across rows, not from
-avoiding the lock on one. A system with much longer-running steps would
-want to split "claim" and "commit" with a lease/heartbeat instead, closer
-to what Temporal does.
+avoiding the lock on one.
+
+For the rare task type that legitimately runs for hours instead of
+seconds, `cadenza/orchestrator.py` also offers an opt-in alternative that
+splits "claim" and "commit" with a lease instead of one held transaction:
+`claim_with_lease` claims the task and commits immediately, releasing the
+row lock; the handler then runs with no transaction open at all; a second
+short transaction records the result exactly like `process_one`'s tail
+does. The cost is a real one - if the worker crashes mid-handler, nothing
+rolls it back automatically, so `sweep_expired_leases` has to be run
+periodically to notice a lease has passed and reset the task to `pending`
+- but that's the correct trade for not pinning a lock for hours. This is
+purely additive: `process_one` / `run_to_completion` are unchanged, and a
+project picks whichever model fits, per task type. See
+[`test_lease_claim_releases_row_lock_before_handler_finishes`](tests/test_orchestrator.py)
+and
+[`test_sweep_expired_leases_recovers_stuck_task`](tests/test_orchestrator.py).
 
 ## How "what happens next" gets decided
 
@@ -192,15 +206,12 @@ the dependency `NOT EXISTS` check, and the `jsonb` merge are exactly the
 things worth catching only-against-the-real-thing bugs in.
 `tests/test_orchestrator.py` proves the engine's guarantees with
 synthetic agents: fan-out/fan-in, retry-then-succeed, exhausted-retry
-cascading block, permanent-failure cascading block, and the
-crash-and-resume proof.
+cascading block, permanent-failure cascading block, the crash-and-resume
+proof, and the opt-in lease model's row-lock-release and lease-recovery
+proofs.
 
 ## What's deliberately out of scope
 
-- **A checkpoint/lease system for very long-running tasks.** The
-  one-transaction-per-task model is exactly right for LLM calls in the
-  seconds range; a step that legitimately runs for hours would want
-  Temporal-style leasing instead of a held row lock. Noted, not built.
 - **A UI.** `build_cli`'s `status`/`trace` commands are the whole
   observability story - scheduling and dashboards are a project's own
   job to provide on top, if it wants one.

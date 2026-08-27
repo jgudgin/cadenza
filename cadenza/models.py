@@ -79,6 +79,17 @@ class Task(Base):
     next_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Only ever set by the opt-in claim/execute/commit lease path
+    # (cadenza/orchestrator.py::process_one_with_lease) - the
+    # one-transaction-per-task path (process_one) never touches this
+    # column. While status == 'running' and this is in the past, the task
+    # is considered abandoned (crashed worker, killed process, ...) and
+    # sweep_expired_leases() will reset it to 'pending' so it becomes
+    # claimable again instead of stuck forever behind a lock that no
+    # longer exists.
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Which task's planning decision produced this one, and why. This is
     # the audit trail that answers "why did the system decide to do this?"
     created_by_task_id: Mapped[int | None] = mapped_column(
