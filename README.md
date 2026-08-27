@@ -1,51 +1,39 @@
 # cadenza
 
-A dynamic, dependency-aware multi-agent orchestration engine, demonstrated
-on a financial-modelling workflow: given a company name, it drafts
-assumptions, builds a 3-statement model, validates it, runs a bull/base/bear
-sensitivity analysis, and exports the result to Excel with a narrative
-summary - deciding what to do next after every step, rather than following
-a fixed pipeline.
+A dynamic, dependency-aware multi-agent orchestration engine: an agent
+completes a task, a planner assesses the result and decides what needs to
+happen next, the appropriate agent or tool is dispatched, the process
+continues - all crash-safe in Postgres, with no in-memory state that a
+crash could lose.
 
-```
-gather_assumptions ──┬─ (if incomplete) ──> gather_assumptions (retry, ≤3 rounds)
-                      └─ (if complete)   ──> build_income_statement
-                                               └──> build_cash_flow
-                                                      └──> build_balance_sheet
-                                                             └──> validate_model
-                                                                    ├─ (imbalance)     ──> escalate
-                                                                    ├─ (bad data)      ──> diagnose_and_fix ──> build_income_statement (replan)
-                                                                    └─ (healthy) ──┬──> sensitivity_analysis (bull)   ─┐
-                                                                                   ├──> sensitivity_analysis (base)   ├──> write_excel ──> summarize_for_user ──> done
-                                                                                   └──> sensitivity_analysis (bear)  ─┘
-```
-
-Every arrow in that diagram is a decision made *at runtime*, by an
-orchestrator inspecting what the previous step actually returned - not a
-pre-declared graph. The three `sensitivity_analysis` branches run
-concurrently; `write_excel` is created in the same planning step as all
-three, with an explicit dependency on all of them, so it starts the moment
-the last one finishes.
+This repo is the engine only. It has no idea what task it's orchestrating
+- no finance code, no fixed workflow, nothing domain-specific at all. See
+[`cadenza-modeler`](https://github.com/jgudgin/cadenza-modeler) for a
+complete real example built on it: a financial-modelling workflow with an
+LLM-drafted-assumptions loop, a validation step that dynamically fans out
+to concurrent scenarios and fans back in to an Excel export, and a
+narrative summary.
 
 ## Why this exists
 
-This is a demonstration project for an AI orchestration engineer role. The
-brief asked for exactly one loop, over and over:
+The brief this was built to demonstrate asked for exactly one loop, over
+and over:
 
 > Agent completes task → results are assessed → next requirement is
 > identified → appropriate agent/tool is deployed → process continues
 
 That loop is the entire engine. `cadenza/orchestrator.py` is under 300
-lines and *is* that loop - everything else (the finance agents, the CLI,
-the API) is a workflow plugged into it.
+lines and *is* that loop - a project plugs in agents (`registry.py`) and
+gets crash safety, retries, dependency resolution, concurrency, and
+observability for free.
 
 It reuses a principle proven in a companion project,
-[`cadence`](../cadence) - a scheduler for linear, crash-safe pipelines
-built on one rule: **the database holds all the state, the process holds
-none.** cadenza keeps that rule and removes cadence's one deliberate
-restriction (steps run in a fixed sequence, never inspecting what came
-before) - because dynamic orchestration is precisely the ability to look
-at a result and decide what happens next.
+[`cadence`](https://github.com/jgudgin/cadence) - a scheduler for linear,
+crash-safe pipelines built on one rule: **the database holds all the
+state, the process holds none.** cadenza keeps that rule and removes
+cadence's one deliberate restriction (steps run in a fixed sequence, never
+inspecting what came before) - because dynamic orchestration is precisely
+the ability to look at a result and decide what happens next.
 
 ## The core guarantee: one task, one transaction
 
@@ -81,17 +69,13 @@ Two kinds of planner, used deliberately for different situations
 (`cadenza/registry.py`):
 
 - **Rule planners** are plain functions. Most transitions in a real
-  workflow aren't actually ambiguous - after the income statement, you
-  always build the balance sheet next - so they cost nothing, are
-  instant, and are fully unit-testable with no mocking
-  (`tests/test_finance_planners.py`).
-- **LLM planners** call Claude with a forced tool-use schema
+  workflow aren't actually ambiguous, so they cost nothing, are instant,
+  and are fully unit-testable with no mocking.
+- **LLM planners** call a model with a forced tool-use schema
   (`cadenza/llm.py::decide_next_steps`), so the decision comes back as
   structured data, not text to parse. Reserved for genuine judgement
-  calls: `validate_model`'s planner is the only LLM-backed decision in
-  this workflow, because "is this validation failure fixable, and what
-  should happen about it" is the one place a fixed rule can't cover the
-  space of real outcomes.
+  calls - the kind of decision a fixed rule can't cover the space of real
+  outcomes for.
 
 Both kinds return the same `PlanOutcome`: new tasks to create (each with
 an optional `key` and `depends_on`, so a single planning call can fan out
@@ -124,27 +108,24 @@ needs to happen next" - not a scheduler loop reasoning about a graph in
 memory, a claim that is correct exactly because Postgres guarantees it
 atomically.
 
-The one genuine hazard this introduces: several tasks running
-concurrently (the three sensitivity scenarios) each want to write into
-the run's shared context. Context updates are applied as a single atomic
+Tasks running concurrently can write into a run's shared context at the
+same time. Context updates are applied as a single atomic
 `UPDATE ... SET context = context || :patch`, not a read-modify-write in
 application code - so two concurrent commits can never lose one another's
 write. Because Postgres's `||` on `jsonb` is a *shallow* merge, agents
-that may run concurrently write disjoint top-level keys
-(`sensitivity_bull`, `sensitivity_base`, `sensitivity_bear`, not a shared
-`sensitivity` dict) - documented in `cadenza/agents/finance/sensitivity.py`.
-A version needing a deep merge under concurrency would use `jsonb_set`
-with an explicit path instead.
+that may run concurrently need to write disjoint top-level keys - a
+version needing a deep merge under concurrency would use `jsonb_set` with
+an explicit path instead.
 
 ## Error handling
 
-Three outcomes an agent can raise, borrowed directly from cadence because
-it's the right vocabulary for any at-least-once task runner:
-`Retry` (transient - back off and try again), `Permanent` (never going to
-work, e.g. a missing required input), `Drop` (not a failure, just no
-longer needed). Anything else raised is treated as `Retry`, because an
-unexpected failure is usually transient - and a genuine dead end still
-stops once `max_attempts` is exhausted.
+Three outcomes an agent can raise (`cadenza/exceptions.py`), the right
+vocabulary for any at-least-once task runner: `Retry` (transient - back
+off and try again), `Permanent` (never going to work, e.g. a missing
+required input), `Drop` (not a failure, just no longer needed). Anything
+else raised is treated as `Retry`, because an unexpected failure is
+usually transient - and a genuine dead end still stops once
+`max_attempts` is exhausted.
 
 A task that permanently fails (or exhausts its retries) doesn't just stop
 - it cascades. `_block_dependents` walks the dependency graph outward
@@ -153,50 +134,48 @@ downstream waiting forever) and marks everything that can now never
 become ready as `blocked`. Nothing sits in `pending` indefinitely for a
 dependency that will never satisfy.
 
-## What's genuinely dynamic here (not staged)
+## Building a project on this
 
-The retry loop in `gather_assumptions` and the escalate/diagnose branch in
-`validate_model` are driven by real model output variability, not a
-scripted failure. Claude drafting a plausible-but-incomplete set of
-assumptions, or one slightly out of a sane range, is a real and expected
-outcome, not an injected bug - which is why `validate` re-checks
-assumption bounds independently rather than only trusting the earlier
-check passed (`cadenza/agents/finance/model_math.py::check_assumptions`,
-shared by both agents that need it).
+A project is: agent handlers (`AgentContext -> dict`), a `plan_next`
+function per agent type (`PlannerInput -> PlanOutcome`), registered
+against a `Registry()` instance, plus a thin CLI/API layer built from the
+reusable pieces this repo provides:
 
-The three financial statements are deliberately *not* an LLM call - they
-follow from the assumptions by arithmetic alone, built so the balance
-sheet balances by construction (net working capital is carried as its own
-line, not just netted into cash flow). `validate_model`'s balance check
-should therefore always pass; it exists as a real regression guard,
-checked every run, not a rehearsed failure mode. If it ever fails, that's
-a bug in `model_math.py`, and the planner is instructed to say so and
-escalate rather than hand it to `diagnose_and_fix` - which can only edit
-assumptions, not this codebase's arithmetic.
+```python
+# myproject/agents.py
+from cadenza.registry import Registry
 
-## Running it
+registry = Registry()
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-docker compose up -d
-export DATABASE_URL="postgresql+asyncpg://postgres:cadenza@localhost:5434/cadenza"
-export ANTHROPIC_API_KEY=...        # only needed for `run`, not `status`/`trace`
-cadenza create-tables
-cadenza run "Some Company Inc"
-cadenza status <run_id>             # task graph and outcome
-cadenza trace <run_id>              # full decision log, with each planner's reasoning
+@registry.agent("do_thing", plan_next=my_planner)
+async def do_thing(ctx):
+    ...
 ```
 
-`status` and `trace` never call an LLM - they only read what's already in
-Postgres, the same reasoning as cadence's `report`/`check`: observability
-should never depend on the thing it's observing being healthy.
+```python
+# myproject/cli.py
+from cadenza.cli import build_cli
+from .agents import registry
 
-An HTTP surface exists too (`cadenza/api.py`, `uvicorn cadenza.api:app`):
-`POST /runs {"company": "..."}` kicks a run off in the background,
-`GET /runs/{id}` and `GET /runs/{id}/trace` poll it - the same
-`start_run`/`run_to_completion` calls the CLI uses, against the same
-database.
+app = build_cli(registry, help="My project.")
+
+@app.command()
+def run(some_friendly_arg: str) -> None:
+    """A project-specific entry point on top of the generic CLI - see
+    cadenza-modeler's `run` command for a full example."""
+```
+
+`cadenza.api.create_app(registry)` does the equivalent for a FastAPI
+surface. Neither `build_cli` nor `create_app` know or care what agents
+are registered - see [`cadenza-modeler`](https://github.com/jgudgin/cadenza-modeler)
+for both used for real.
+
+```bash
+pip install -e ".[anthropic]"       # only needed if any agent uses cadenza.llm
+docker compose up -d
+export DATABASE_URL="postgresql+asyncpg://postgres:cadenza@localhost:5434/cadenza"
+export ANTHROPIC_API_KEY=...        # only if using cadenza.llm's LLM planner
+```
 
 ## Tests
 
@@ -211,29 +190,22 @@ Each test gets its own throwaway Postgres schema (`tests/conftest.py`),
 against real Postgres - no mocking the database, because `SKIP LOCKED`,
 the dependency `NOT EXISTS` check, and the `jsonb` merge are exactly the
 things worth catching only-against-the-real-thing bugs in.
-
-`tests/test_orchestrator.py` proves the engine's guarantees with synthetic
-agents (fan-out/fan-in, retry-then-succeed, exhausted-retry cascading
-block, permanent-failure cascading block, crash-and-resume).
-`tests/test_finance_planners.py` unit-tests the rule planners directly, no
-database needed. `tests/test_finance_workflow.py` drives the *entire*
-finance DAG through the real orchestrator against real Postgres, with the
-two LLM call sites swapped for canned responses - so the whole thing,
-including a real generated `.xlsx` file, is provable in CI with no API key
-and no network call.
+`tests/test_orchestrator.py` proves the engine's guarantees with
+synthetic agents: fan-out/fan-in, retry-then-succeed, exhausted-retry
+cascading block, permanent-failure cascading block, and the
+crash-and-resume proof.
 
 ## What's deliberately out of scope
 
 - **A checkpoint/lease system for very long-running tasks.** The
   one-transaction-per-task model is exactly right for LLM calls in the
   seconds range; a step that legitimately runs for hours would want
-  Temporal-style leasing instead of a held row lock. Noted, not built -
-  nothing in this codebase needed it.
-- **A UI.** `status`/`trace` are the whole observability story, same as
-  cadence's stance: scheduling and dashboards are somebody else's job to
-  provide.
-- **Vendor lock-in to Claude.** The only Anthropic-specific code is
-  `cadenza/llm.py` (about 130 lines) - a planner is a function returning
-  `PlanOutcome`, and nothing in `orchestrator.py` or `registry.py` knows
-  or cares what produced one. Swapping models, or replacing the LLM
-  planner with a different provider entirely, touches one file.
+  Temporal-style leasing instead of a held row lock. Noted, not built.
+- **A UI.** `build_cli`'s `status`/`trace` commands are the whole
+  observability story - scheduling and dashboards are a project's own
+  job to provide on top, if it wants one.
+- **Vendor lock-in to any LLM provider.** The only model-specific code is
+  `cadenza/llm.py` (about 130 lines, currently Anthropic, gated behind an
+  optional `anthropic` extra so nothing else in the engine depends on
+  it) - a planner is a function returning `PlanOutcome`, and nothing in
+  `orchestrator.py` or `registry.py` knows or cares what produced one.

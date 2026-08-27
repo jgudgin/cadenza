@@ -1,15 +1,21 @@
-"""cadenza run "Some Company"      - build a model end-to-end
-cadenza status <run_id>          - current task graph and outcome
-cadenza trace <run_id>           - the full decision log, in order
-cadenza create-tables            - one-time schema setup
+"""Generic CLI commands, reusable by any project built on cadenza.
 
-status and trace never touch the LLM - they only read what's already in
-Postgres, so they work with no ANTHROPIC_API_KEY set at all.
+`build_cli(registry)` returns a Typer app with the domain-agnostic
+commands every project needs (`start`, `status`, `trace`,
+`create-tables`); a project adds its own commands on top of the returned
+app for anything that needs to know its own task types (e.g. a `run`
+command that seeds a specific first task with a friendly argument, the
+way the finance demo's `cadenza-model run "Some Company"` does).
+
+`status`/`trace` never touch an LLM - they only read what's already in
+Postgres, so they work with no API key set at all, regardless of what a
+project's agents need.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 
 import typer
 from rich.console import Console
@@ -17,54 +23,63 @@ from rich.table import Table
 from sqlalchemy import select
 
 from . import db
-from .agents import registry
 from .models import Event, Task, WorkflowRun
 from .orchestrator import run_to_completion, start_run
-from .registry import TaskSpec
+from .registry import Registry, TaskSpec
 
-app = typer.Typer(add_completion=False, help="Dynamic multi-agent orchestration, demonstrated on financial modelling.")
 console = Console()
 
 
-@app.command()
-def run(company: str, concurrency: int = 3) -> None:
-    """Build a 3-statement model for COMPANY end-to-end."""
-    asyncio.run(_run(company, concurrency))
+def build_cli(registry: Registry, *, help: str = "Dynamic multi-agent orchestration.") -> typer.Typer:
+    app = typer.Typer(add_completion=False, help=help)
 
+    @app.command()
+    def start(goal: str, seed_type: str, seed_input: str = "{}", concurrency: int = 3) -> None:
+        """Start a run from a raw seed task type/input (JSON). Most
+        projects will add their own friendlier `run` command on top of
+        this app instead of asking users to hand-write JSON."""
+        asyncio.run(_start(goal, seed_type, json.loads(seed_input), concurrency))
 
-async def _run(company: str, concurrency: int) -> None:
-    engine = db.make_engine()
-    session_factory = db.make_session_factory(engine)
-    await db.create_tables(engine)
+    async def _start(goal: str, seed_type: str, seed_input: dict, concurrency: int) -> None:
+        engine = db.make_engine()
+        session_factory = db.make_session_factory(engine)
+        await db.create_tables(engine)
 
-    goal = (
-        f"Build a 3-year, 3-statement financial model for {company}, including a "
-        "bull/base/bear sensitivity table, exported to Excel with a narrative summary."
-    )
-    run_id = await start_run(
-        session_factory, goal, TaskSpec(type="gather_assumptions", input={"company": company, "round": 1})
-    )
-    console.print(f"[bold]Run {run_id}[/bold] started.\nGoal: {goal}\n")
+        run_id = await start_run(session_factory, goal, TaskSpec(type=seed_type, input=seed_input))
+        console.print(f"[bold]Run {run_id}[/bold] started.\nGoal: {goal}\n")
 
-    await run_to_completion(session_factory, registry, run_id, concurrency=concurrency)
-    await _print_status(session_factory, run_id)
-    await engine.dispose()
+        await run_to_completion(session_factory, registry, run_id, concurrency=concurrency)
+        await print_status(session_factory, run_id)
+        await engine.dispose()
 
+    @app.command()
+    def status(run_id: int) -> None:
+        """Show a run's tasks and current outcome."""
+        asyncio.run(_status(run_id))
 
-@app.command()
-def status(run_id: int) -> None:
-    """Show a run's tasks and current outcome."""
-    asyncio.run(_status(run_id))
+    @app.command()
+    def trace(run_id: int) -> None:
+        """Print the full decision log for a run, in order - the
+        observability layer: every dispatch, every planner decision and
+        its reasoning, every failure, one line each."""
+        asyncio.run(_trace(run_id))
+
+    @app.command(name="create-tables")
+    def create_tables_cmd() -> None:
+        """One-time schema setup against DATABASE_URL."""
+        asyncio.run(_create_tables())
+
+    return app
 
 
 async def _status(run_id: int) -> None:
     engine = db.make_engine()
     session_factory = db.make_session_factory(engine)
-    await _print_status(session_factory, run_id)
+    await print_status(session_factory, run_id)
     await engine.dispose()
 
 
-async def _print_status(session_factory, run_id: int) -> None:  # noqa: ANN001
+async def print_status(session_factory, run_id: int) -> None:  # noqa: ANN001
     async with session_factory() as session:
         run = await session.get(WorkflowRun, run_id)
         if run is None:
@@ -78,7 +93,7 @@ async def _print_status(session_factory, run_id: int) -> None:  # noqa: ANN001
     console.print(f"Goal: {run.goal}\n")
 
     table = Table(show_header=True, header_style="bold")
-    for col in ("id", "type", "status", "attempts", "depends via", "error"):
+    for col in ("id", "type", "status", "attempts", "created by", "error"):
         table.add_column(col)
     for t in tasks:
         table.add_row(
@@ -91,18 +106,8 @@ async def _print_status(session_factory, run_id: int) -> None:  # noqa: ANN001
         )
     console.print(table)
 
-    if run.context.get("excel_path"):
-        console.print(f"\n[green]Workbook:[/green] {run.context['excel_path']}")
-    if run.context.get("summary"):
-        console.print(f"\n[bold]Summary:[/bold]\n{run.context['summary']}")
-
-
-@app.command()
-def trace(run_id: int) -> None:
-    """Print the full decision log for a run, in order - the observability
-    layer: every dispatch, every planner decision and its reasoning, every
-    failure, one line each."""
-    asyncio.run(_trace(run_id))
+    if run.context:
+        console.print(f"\n[dim]Context keys: {', '.join(sorted(run.context))}[/dim]")
 
 
 async def _trace(run_id: int) -> None:
@@ -126,18 +131,8 @@ def _format_payload(payload: dict) -> str:
     return str(payload)[:140]
 
 
-@app.command(name="create-tables")
-def create_tables_cmd() -> None:
-    """One-time schema setup against DATABASE_URL."""
-    asyncio.run(_create_tables())
-
-
 async def _create_tables() -> None:
     engine = db.make_engine()
     await db.create_tables(engine)
     await engine.dispose()
     console.print("[green]Tables created.[/green]")
-
-
-if __name__ == "__main__":
-    app()
