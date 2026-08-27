@@ -3,15 +3,16 @@ code lives here - this module is the guardrail layer the coding agent's
 tools are built on top of, and it is deliberately boring and restrictive:
 
 - every run gets its own git worktree, on its own branch, checked out from
-  `main` - never a direct edit of the working directory this session (or
-  any other) actually has open, and never a commit on main itself.
+  a base branch (`main` unless overridden - see `create_worktree`'s `base`)
+  - never a direct edit of the working directory this session (or any
+  other) actually has open, and never a commit on the base branch itself.
 - `safe_path` confines every read/write to inside that worktree, and
   denylists `.git` and `.github` specifically so an agent editing source
   can't rewrite its own guardrails or tamper with CI config.
 - `run_tests` is the only way code in the worktree gets executed, and it
   always runs the same fixed pytest invocation - no arbitrary shell.
-- `open_pull_request` only ever opens a PR against `main`; nothing in this
-  module merges one.
+- `open_pull_request` only ever opens a PR against that same base branch;
+  nothing in this module merges one.
 """
 
 from __future__ import annotations
@@ -36,14 +37,20 @@ def slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len] or "task"
 
 
-def create_worktree(repo_path: str, branch_name: str) -> str:
+def create_worktree(repo_path: str, branch_name: str, *, base: str = "main") -> str:
+    """`base` is what the new branch is cut from - almost always `main`,
+    but a project actively developing this agent itself on a feature
+    branch (e.g. cadenza's own `self-maintainer`) needs to point it there
+    instead, or every agent's worktree silently won't have that branch's
+    code at all. Never itself a protected branch to *commit to* - that's
+    `branch_name`, checked below - `base` is only ever read from."""
     if branch_name in PROTECTED_BRANCHES:
         raise ValueError(f"refusing to use {branch_name!r} as the agent's working branch")
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     worktree_path = WORKTREE_ROOT / branch_name.replace("/", "-")
     _clear_stale_attempt(repo_path, branch_name, worktree_path)
     result = _run(
-        ["git", "-C", repo_path, "worktree", "add", "-b", branch_name, str(worktree_path), "main"],
+        ["git", "-C", repo_path, "worktree", "add", "-b", branch_name, str(worktree_path), base],
         timeout=30,
     )
     if result.returncode != 0:

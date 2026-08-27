@@ -53,6 +53,21 @@ def test_create_worktree_refuses_protected_branches(repo):
         workspace.create_worktree(repo, "main")
 
 
+def test_create_worktree_base_overrides_main(repo):
+    """A project developing this agent itself on a feature branch needs
+    worktrees cut from that branch, not main - otherwise every agent's
+    worktree silently lacks the very code it's meant to work on."""
+    _run(["git", "checkout", "-b", "feature"], cwd=repo)
+    (pathlib.Path(repo) / "feature_only.txt").write_text("only on feature\n")
+    _run(["git", "add", "feature_only.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "feature-only file"], cwd=repo)
+    _run(["git", "checkout", "main"], cwd=repo)
+
+    worktree_path = workspace.create_worktree(repo, "self-maintain/from-feature", base="feature")
+
+    assert (pathlib.Path(worktree_path) / "feature_only.txt").exists()
+
+
 def test_safe_path_confines_to_the_worktree(tmp_path):
     base = tmp_path / "wt"
     base.mkdir()

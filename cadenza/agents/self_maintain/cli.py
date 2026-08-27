@@ -38,14 +38,22 @@ def run(
     concurrency: int = 1,
     repo: str = "",
     max_open_prs: int = 0,
+    base: str = "",
 ) -> None:
     """Start a self-maintenance run for one task description and drive it
     to completion (retrying once with test-failure feedback, then
-    escalating rather than looping forever - see maintain.plan_self_maintain)."""
+    escalating rather than looping forever - see maintain.plan_self_maintain).
+
+    --base overrides what every agent's worktree/PR is built against
+    (defaults to "main"): use it when the code being worked on only lives
+    on a feature branch that hasn't reached main yet, or agents' worktrees
+    won't have it at all."""
     if repo:
         maintain.REPO_PATH = repo
     if max_open_prs:
         maintain.MAX_OPEN_PRS = max_open_prs
+    if base:
+        maintain.BASE_BRANCH = base
     asyncio.run(_run(task, concurrency))
 
 
@@ -55,7 +63,10 @@ async def _run(task: str, concurrency: int) -> None:
     await create_tables(engine)
 
     run_id = await start_run(session_factory, task, TaskSpec(type="self_maintain", input={"task": task}))
-    console.print(f"[bold]Run {run_id}[/bold] started.\nTask: {task}\nRepo: {maintain.REPO_PATH}\n")
+    console.print(
+        f"[bold]Run {run_id}[/bold] started.\nTask: {task}\n"
+        f"Repo: {maintain.REPO_PATH}\nBase: {maintain.BASE_BRANCH}\n"
+    )
 
     await run_to_completion(session_factory, registry, run_id, concurrency=concurrency)
     await print_status(session_factory, run_id)
@@ -68,14 +79,20 @@ def plan(
     concurrency: int = 3,
     repo: str = "",
     max_open_prs: int = 0,
+    base: str = "",
 ) -> None:
     """Clarify a rough idea interactively, split it into independent
     subtasks, and fan out to one self-maintenance agent per subtask,
-    running concurrently - each ends in its own PR (or escalation)."""
+    running concurrently - each ends in its own PR (or escalation).
+
+    --base overrides what every agent's worktree/PR is built against
+    (defaults to "main") - see `run --help` for why that matters."""
     if repo:
         maintain.REPO_PATH = repo
     if max_open_prs:
         maintain.MAX_OPEN_PRS = max_open_prs
+    if base:
+        maintain.BASE_BRANCH = base
     asyncio.run(_plan(rough_idea, concurrency))
 
 
@@ -92,7 +109,7 @@ async def _plan(rough_idea: str, concurrency: int) -> None:
     await create_tables(engine)
 
     run_id = await start_run(session_factory, rough_idea, TaskSpec(type="plan_maintenance", input={"brief": brief}))
-    console.print(f"[bold]Run {run_id}[/bold] started.\nRepo: {maintain.REPO_PATH}\n")
+    console.print(f"[bold]Run {run_id}[/bold] started.\nRepo: {maintain.REPO_PATH}\nBase: {maintain.BASE_BRANCH}\n")
 
     await run_to_completion(session_factory, registry, run_id, concurrency=concurrency)
     await print_subtask_outcomes(session_factory, run_id)

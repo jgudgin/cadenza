@@ -28,6 +28,12 @@ from .tools import run_coding_loop
 
 REPO_PATH = os.environ.get("CADENZA_SELF_MAINTAIN_REPO", str(pathlib.Path.cwd()))
 MAX_OPEN_PRS = int(os.environ.get("CADENZA_SELF_MAINTAIN_MAX_OPEN_PRS", "5"))
+# What every agent's worktree is cut from - almost always "main", the only
+# thing open_pull_request ever targets as a base too. Override when the
+# code being worked on only exists on a feature branch that hasn't reached
+# main yet (as cadenza's own self-maintenance agent code does right now,
+# on "self-maintainer") - otherwise every worktree silently won't have it.
+BASE_BRANCH = os.environ.get("CADENZA_SELF_MAINTAIN_BASE_BRANCH", "main")
 LABEL = "self-maintain"
 
 
@@ -41,7 +47,9 @@ async def self_maintain(ctx: AgentContext) -> dict:
 
     branch_name = f"self-maintain/{workspace.slugify(task)}-{ctx.task_id}"
     try:
-        worktree_path = await asyncio.to_thread(workspace.create_worktree, REPO_PATH, branch_name)
+        worktree_path = await asyncio.to_thread(
+            workspace.create_worktree, REPO_PATH, branch_name, base=BASE_BRANCH
+        )
     except Exception as exc:
         raise Retry(f"could not create worktree: {exc}") from exc
 
@@ -59,6 +67,7 @@ async def self_maintain(ctx: AgentContext) -> dict:
         branch_name,
         title=f"self-maintain: {task[:60]}",
         body=result["summary"],
+        base=BASE_BRANCH,
         labels=[LABEL],
     )
     return {**result, "pr_url": pr_url}
