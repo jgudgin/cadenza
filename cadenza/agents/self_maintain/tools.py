@@ -22,6 +22,13 @@ from . import workspace
 MODEL = "claude-sonnet-5"
 MAX_TURNS = 20
 MAX_FILE_BYTES = 200_000
+# claude-sonnet-5 emits extended-thinking content by default, and it counts
+# against max_tokens like everything else: on a hard turn the model can burn
+# the whole budget on thinking and hit stop_reason="max_tokens" before
+# producing a single tool_use or word of text - a silent, totally opaque
+# failure (see the "model stopped without calling a tool" case below).
+# Generous headroom, not 4096.
+MAX_TOKENS = 16_000
 
 _TOOLS = [
     {
@@ -124,7 +131,7 @@ async def run_coding_loop(*, worktree_path: str, task: str, previous_failure: st
 
     for _ in range(MAX_TURNS):
         response = await _client().messages.create(
-            model=MODEL, max_tokens=4096, system=system, tools=_TOOLS, messages=messages
+            model=MODEL, max_tokens=MAX_TOKENS, system=system, tools=_TOOLS, messages=messages
         )
         messages.append({"role": "assistant", "content": response.content})
 
