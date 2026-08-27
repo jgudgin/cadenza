@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Real Postgres, not a mock - the whole point of this test suite is to
+    # catch what only shows up against it (SKIP LOCKED, the dependency
+    # NOT EXISTS check, the jsonb `||` merge under real concurrency).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: cadenza
+          POSTGRES_DB: cadenza
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:cadenza@localhost:5432/cadenza
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install cadenza
+        # anthropic isn't optional here in practice: cadenza/agents/__init__.py
+        # registers self_maintain unconditionally, and its coding loop imports
+        # the anthropic package at module load time. No ANTHROPIC_API_KEY is
+        # needed to test it though - every test that would call the API mocks
+        # the call site instead (see tests/test_self_maintain_tools.py and
+        # test_finance_workflow.py's precedent), the same "canned for CI"
+        # principle used throughout this repo's LLM-touching tests.
+        run: pip install -e ".[dev,anthropic]"
+
+      - name: Run tests
+        run: pytest -v

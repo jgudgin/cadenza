@@ -6,3 +6,6 @@ __pycache__/
 .env
 output/
 *.xlsx
+
+#claude
+ .claude/settings.local.json

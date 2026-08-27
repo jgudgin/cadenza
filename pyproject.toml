@@ -11,7 +11,11 @@ dependencies = [
     "pydantic>=2.8",
     "typer>=0.12",
     "rich>=13.7",
+    "python-dotenv>=1.0",
 ]
+
+[project.scripts]
+cadenza-self-maintain = "cadenza.agents.self_maintain.cli:main"
 
 [project.optional-dependencies]
 # LLM-backed planners (cadenza.llm) are optional - the engine itself has no
