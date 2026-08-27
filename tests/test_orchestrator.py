@@ -6,6 +6,8 @@
 - Retry backs off and eventually succeeds; exhausting retries fails the
   task and cascades to block anything waiting on it
 - Permanent fails immediately and cascades the same way
+- Drop marks a task as no longer needed (not an error) and cascades the
+  same way
 - a crash between "claim" and "commit" - even one from a bug in the
   planner itself, not just the agent - rolls back completely and the task
   is exactly as claimable as if nothing had happened
@@ -19,7 +21,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select, text
 
-from cadenza.exceptions import Permanent, Retry
+from cadenza.exceptions import Drop, Permanent, Retry
 from cadenza.models import RunStatus, Task, TaskDependency, WorkflowRun
 from cadenza.orchestrator import process_one, run_to_completion, start_run
 from cadenza.registry import PlanOutcome, Registry, TaskSpec
@@ -193,6 +195,49 @@ async def test_permanent_failure_blocks_dependents(session_factory):
         dep_after = await session.get(Task, dep_id)
 
     assert seed_after.status == "failed"
+    assert dep_after.status == "blocked"
+
+
+async def test_dropped_task_blocks_dependents(session_factory):
+    """Drop is not an error - the planner decided the task is no longer
+    needed - but anything depending on it still can never become ready, so
+    it must cascade to 'blocked' exactly like a real failure does."""
+    reg = Registry()
+
+    async def superseded(ctx):
+        raise Drop("no longer needed, superseded by a replan")
+
+    async def plan_unreachable(input):
+        raise AssertionError("plan_next must never run for a dropped task")
+
+    reg.agent("superseded", plan_next=plan_unreachable)(superseded)
+
+    async def dependent(ctx):
+        return {}
+
+    async def plan_dependent(input):
+        return PlanOutcome(run_complete=True)
+
+    reg.agent("dependent", plan_next=plan_dependent)(dependent)
+
+    run_id = await start_run(session_factory, "superseded", TaskSpec(type="superseded"))
+
+    async with session_factory() as session:
+        seed = (await session.execute(select(Task).where(Task.run_id == run_id))).scalar_one()
+        dep = Task(run_id=run_id, type="dependent")
+        session.add(dep)
+        await session.flush()
+        session.add(TaskDependency(task_id=dep.id, depends_on_task_id=seed.id))
+        await session.commit()
+        seed_id, dep_id = seed.id, dep.id
+
+    assert await process_one(session_factory, reg, run_id)
+
+    async with session_factory() as session:
+        seed_after = await session.get(Task, seed_id)
+        dep_after = await session.get(Task, dep_id)
+
+    assert seed_after.status == "dropped"
     assert dep_after.status == "blocked"
 
 
