@@ -7,12 +7,20 @@ continues - all crash-safe in Postgres, with no in-memory state that a
 crash could lose.
 
 This repo is the engine only. It has no idea what task it's orchestrating
-- no fixed workflow, nothing domain-specific at all. See
-[`cadenza-modeler`](https://github.com/jgudgin/cadenza-modeler) for a
-complete real example built on it: a financial-modelling workflow with an
-LLM-drafted-assumptions loop, a validation step that dynamically fans out
-to concurrent scenarios and fans back in to an Excel export, and a
-narrative summary.
+- no fixed workflow, nothing domain-specific at all. Two complete real
+examples built on it:
+
+- [`cadenza-modeler`](https://github.com/jgudgin/cadenza-modeler) - a
+  financial-modelling workflow with an LLM-drafted-assumptions loop, a
+  validation step that dynamically fans out to concurrent scenarios and
+  fans back in to an Excel export, and a narrative summary.
+- [`cadenza-self-maintain`](https://github.com/jgudgin/cadenza-self-maintain) -
+  a bounded coding agent that points at any git repo, edits code in an
+  isolated worktree, and opens a PR only once the real test suite passes;
+  a "boss agent" variant clarifies a rough request and fans it out to
+  concurrent subtasks. (Originally built and proven directly in this
+  repo, on itself, before being extracted for the same reason
+  `cadenza-modeler` was.)
 
 ## Why this exists
 

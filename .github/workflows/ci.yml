@@ -39,14 +39,7 @@ jobs:
           cache: "pip"
 
       - name: Install cadenza
-        # anthropic isn't optional here in practice: cadenza/agents/__init__.py
-        # registers self_maintain unconditionally, and its coding loop imports
-        # the anthropic package at module load time. No ANTHROPIC_API_KEY is
-        # needed to test it though - every test that would call the API mocks
-        # the call site instead (see tests/test_self_maintain_tools.py and
-        # test_finance_workflow.py's precedent), the same "canned for CI"
-        # principle used throughout this repo's LLM-touching tests.
-        run: pip install -e ".[dev,anthropic]"
+        run: pip install -e ".[dev]"
 
       - name: Run tests
         run: pytest -v
