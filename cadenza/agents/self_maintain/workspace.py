@@ -43,14 +43,27 @@ def create_worktree(repo_path: str, branch_name: str, *, base: str = "main") -> 
     branch (e.g. cadenza's own `self-maintainer`) needs to point it there
     instead, or every agent's worktree silently won't have that branch's
     code at all. Never itself a protected branch to *commit to* - that's
-    `branch_name`, checked below - `base` is only ever read from."""
+    `branch_name`, checked below - `base` is only ever read from.
+
+    Always fetches and branches off `origin/{base}`, never the local
+    branch pointer of that name - `git fetch` updates remote-tracking refs
+    but never fast-forwards a local branch you don't currently have
+    checked out, so a long-lived clone's local `main` silently drifts
+    behind `origin/main` with every merge nobody re-checked-out for. Hit
+    this for real: an agent branched off a local `main` 12 commits stale
+    and missing this very package, and fabricated a parallel
+    implementation rather than finding the real one (see the PRs this
+    produced and had to be closed, #5 and #6)."""
     if branch_name in PROTECTED_BRANCHES:
         raise ValueError(f"refusing to use {branch_name!r} as the agent's working branch")
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     worktree_path = WORKTREE_ROOT / branch_name.replace("/", "-")
     _clear_stale_attempt(repo_path, branch_name, worktree_path)
+    fetch_result = _run(["git", "-C", repo_path, "fetch", "origin", base], timeout=30)
+    if fetch_result.returncode != 0:
+        raise RuntimeError(f"git fetch origin {base} failed: {fetch_result.stderr}")
     result = _run(
-        ["git", "-C", repo_path, "worktree", "add", "-b", branch_name, str(worktree_path), base],
+        ["git", "-C", repo_path, "worktree", "add", "-b", branch_name, str(worktree_path), f"origin/{base}"],
         timeout=30,
     )
     if result.returncode != 0:
