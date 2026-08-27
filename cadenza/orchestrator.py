@@ -15,6 +15,12 @@ deliberate trade-off, not an oversight: it is what makes "claimed twice" or
 the seconds the call takes. Fine at this scale; a system doing enormously
 long-running tasks would want to split claim and commit with a lease/
 heartbeat instead (closer to what Temporal does).
+
+That lease/heartbeat alternative lives in this module too, further down
+(`process_one_with_lease`, `claim_with_lease`, `sweep_expired_leases`) -
+purely additive and opt-in. It does not replace `process_one` /
+`run_to_completion`; a project picks whichever model fits a given task
+type, per task type, and both can be in flight in the same run.
 """
 
 from __future__ import annotations
@@ -335,3 +341,253 @@ async def run_to_completion(
 
     await asyncio.gather(*(worker() for _ in range(concurrency)))
     await _finalize_if_stuck(session_factory, run_id)
+
+
+# ---------------------------------------------------------------------------
+# Opt-in lease/heartbeat model, for handlers that legitimately run for hours
+# instead of seconds.
+#
+# `process_one` above holds one open transaction (and therefore one row
+# lock) for the entire handler call, on purpose: it's what makes "claimed
+# twice" and "half-applied plan" structurally impossible, for free, as long
+# as the handler is fast enough that a held lock is cheap. When it isn't -
+# a handler that legitimately runs for hours - holding a transaction (and a
+# database connection) open that whole time is the wrong trade.
+#
+# The model here instead:
+#   1. claim_with_lease: one short transaction claims the task, sets
+#      status='running' and lease_expires_at = now() + lease_seconds, and
+#      commits immediately - the row lock is released right away, not held
+#      for the handler's duration.
+#   2. the handler runs with *no* transaction held open at all.
+#   3. a second short transaction records the result and applies the
+#      planner's decision, exactly like the tail of process_one does.
+#
+# The cost of that trade: between (1) and (3) nothing but lease_expires_at
+# says the task is spoken for. If the worker crashes before (3), the task
+# sits in 'running' until sweep_expired_leases() notices the lease expired
+# and resets it to 'pending' - recovery is a periodic sweep instead of an
+# automatic rollback. That's the deliberate trade for not pinning a
+# connection/lock for hours: a real bound (the lease) on how long a crash
+# can leave a task stuck, instead of an unbounded one.
+# ---------------------------------------------------------------------------
+
+DEFAULT_LEASE_SECONDS = 3600.0  # 1 hour; pick per task type based on the handler
+
+_CLAIM_LEASE_SQL = text(
+    """
+    WITH next_task AS (
+        SELECT t.id
+        FROM cadenza_tasks t
+        WHERE t.run_id = :run_id
+          AND t.status = 'pending'
+          AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= now())
+          AND NOT EXISTS (
+              SELECT 1
+              FROM cadenza_task_dependencies d
+              JOIN cadenza_tasks dep ON dep.id = d.depends_on_task_id
+              WHERE d.task_id = t.id AND dep.status <> 'completed'
+          )
+        ORDER BY t.created_at
+        FOR UPDATE OF t SKIP LOCKED
+        LIMIT 1
+    )
+    UPDATE cadenza_tasks
+    SET status = 'running',
+        attempts = attempts + 1,
+        updated_at = now(),
+        lease_expires_at = now() + make_interval(secs => :lease_seconds)
+    FROM next_task
+    WHERE cadenza_tasks.id = next_task.id
+    RETURNING cadenza_tasks.id
+    """
+)
+
+_SWEEP_LEASE_SQL = text(
+    """
+    UPDATE cadenza_tasks
+    SET status = 'pending', lease_expires_at = NULL, updated_at = now()
+    WHERE run_id = :run_id
+      AND status = 'running'
+      AND lease_expires_at IS NOT NULL
+      AND lease_expires_at <= now()
+    RETURNING id
+    """
+)
+
+
+async def claim_with_lease(
+    session_factory: async_sessionmaker[AsyncSession],
+    run_id: int,
+    lease_seconds: float = DEFAULT_LEASE_SECONDS,
+) -> int | None:
+    """The claim step of the lease model: one short transaction, committed
+    immediately, so the row lock is gone before anyone even thinks about
+    calling a handler. Returns the claimed task's id, or None if nothing
+    was ready."""
+    async with session_factory() as session:
+        result = await session.execute(
+            _CLAIM_LEASE_SQL, {"run_id": run_id, "lease_seconds": lease_seconds}
+        )
+        row = result.first()
+        if row is None:
+            return None
+        task_id = row.id
+        session.add(
+            Event(
+                run_id=run_id,
+                task_id=task_id,
+                type="task_leased",
+                payload={"lease_seconds": lease_seconds},
+            )
+        )
+        await session.commit()
+        return task_id
+
+
+async def process_one_with_lease(
+    session_factory: async_sessionmaker[AsyncSession],
+    registry: Registry,
+    run_id: int,
+    *,
+    lease_seconds: float = DEFAULT_LEASE_SECONDS,
+) -> bool:
+    """The lease/heartbeat alternative to `process_one`. Claim and commit
+    are two independent short transactions instead of one held open for
+    the whole handler call; between them the handler runs free of any open
+    transaction or row lock. Returns False if nothing was ready to claim.
+
+    Opt-in and additive: nothing about `process_one` changes, and a
+    project can use either model per task type."""
+    task_id = await claim_with_lease(session_factory, run_id, lease_seconds)
+    if task_id is None:
+        return False
+
+    async with session_factory() as session:
+        task = await session.get(Task, task_id)
+        run = await session.get(WorkflowRun, run_id)
+        spec = registry.get(task.type)
+        ctx = AgentContext(run_id=run_id, task_id=task.id, input=task.input, run_context=run.context)
+
+    # No transaction (and no lock) held here, however long the handler
+    # takes - the entire point of this model.
+    error: Exception | None = None
+    outcome_kind = "output"
+    output: dict | None = None
+    try:
+        output = await spec.handler(ctx)
+    except Drop as exc:
+        error, outcome_kind = exc, "drop"
+    except Permanent as exc:
+        error, outcome_kind = exc, "permanent"
+    except Exception as exc:  # Retry, or anything unexpected - same treatment
+        error, outcome_kind = exc, "retry"
+
+    async with session_factory() as session:
+        task = await session.get(Task, task_id)
+        run = await session.get(WorkflowRun, run_id)
+        spec = registry.get(task.type)
+        # The lease has done its job; whatever happens next resolves the
+        # task's fate immediately, so there's nothing left to lease.
+        task.lease_expires_at = None
+
+        if outcome_kind == "drop":
+            task.status = TaskStatus.dropped.value
+            task.last_error = str(error)
+            session.add(Event(run_id=run_id, task_id=task.id, type="task_dropped", payload={"reason": str(error)}))
+            await _block_dependents(session, run_id, task.id, f"upstream task dropped: {error}")
+            await session.commit()
+            return True
+
+        if outcome_kind == "permanent":
+            task.status = TaskStatus.failed.value
+            task.last_error = str(error)
+            session.add(
+                Event(
+                    run_id=run_id,
+                    task_id=task.id,
+                    type="task_failed",
+                    payload={"reason": str(error), "permanent": True},
+                )
+            )
+            await _block_dependents(session, run_id, task.id, f"upstream task failed: {error}")
+            await session.commit()
+            return True
+
+        if outcome_kind == "retry":
+            if task.attempts >= spec.max_attempts:
+                task.status = TaskStatus.failed.value
+                task.last_error = f"gave up after {task.attempts} attempts: {error}"
+                log.warning(
+                    "task %s (%s) gave up after %s attempts: %s", task.id, task.type, task.attempts, error
+                )
+                session.add(
+                    Event(
+                        run_id=run_id,
+                        task_id=task.id,
+                        type="task_failed",
+                        payload={"reason": str(error), "attempts": task.attempts},
+                    )
+                )
+                await _block_dependents(session, run_id, task.id, f"upstream task exhausted retries: {error}")
+            else:
+                task.status = TaskStatus.pending.value
+                task.last_error = str(error)
+                task.next_attempt_at = backoff(task.attempts)
+                session.add(
+                    Event(
+                        run_id=run_id,
+                        task_id=task.id,
+                        type="task_retry",
+                        payload={"reason": str(error), "attempt": task.attempts},
+                    )
+                )
+            await session.commit()
+            return True
+
+        task.status = TaskStatus.completed.value
+        task.output = output
+        session.add(Event(run_id=run_id, task_id=task.id, type="task_completed", payload={"output": output}))
+
+        planner_input = PlannerInputData(
+            goal=run.goal,
+            run_context=run.context,
+            completed_task_type=task.type,
+            completed_task_input=task.input,
+            output=output,
+            task_id=task.id,
+        )
+        outcome = await spec.plan_next(planner_input)
+        await _apply_plan(session, run, task, outcome)
+
+        await session.commit()
+        return True
+
+
+async def sweep_expired_leases(
+    session_factory: async_sessionmaker[AsyncSession], run_id: int
+) -> list[int]:
+    """Recover tasks whose lease expired before the worker holding it ever
+    reached the commit step - most likely because that worker crashed.
+    Resets status back to 'pending' (attempts unchanged, since the task
+    never actually got a chance to run to a result) so it becomes
+    claimable again, exactly like a plain pending task.
+
+    Call this periodically (a cron job, a background task, a poll loop)
+    for any run using the lease model. The held-transaction model
+    (`process_one`) needs no equivalent - a rollback there does the same
+    job for free, immediately, rather than after a sweep interval."""
+    async with session_factory() as session:
+        result = await session.execute(_SWEEP_LEASE_SQL, {"run_id": run_id})
+        recovered_ids = [row.id for row in result.all()]
+        for task_id in recovered_ids:
+            session.add(
+                Event(
+                    run_id=run_id,
+                    task_id=task_id,
+                    type="lease_expired_reclaimed",
+                    payload={},
+                )
+            )
+        await session.commit()
+        return recovered_ids

@@ -11,6 +11,10 @@
 - a crash between "claim" and "commit" - even one from a bug in the
   planner itself, not just the agent - rolls back completely and the task
   is exactly as claimable as if nothing had happened
+- the opt-in lease/heartbeat model: claiming a task releases its row lock
+  immediately rather than holding it for the handler's duration, and a
+  lease that expires before a worker finishes is recovered by a sweep
+  instead of being stuck forever
 
 These are synthetic agents, not the finance ones: no ANTHROPIC_API_KEY
 needed, and each test isolates exactly one engine behaviour.
@@ -18,12 +22,21 @@ needed, and each test isolates exactly one engine behaviour.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from sqlalchemy import select, text
 
 from cadenza.exceptions import Drop, Permanent, Retry
 from cadenza.models import RunStatus, Task, TaskDependency, WorkflowRun
-from cadenza.orchestrator import process_one, run_to_completion, start_run
+from cadenza.orchestrator import (
+    claim_with_lease,
+    process_one,
+    process_one_with_lease,
+    run_to_completion,
+    start_run,
+    sweep_expired_leases,
+)
 from cadenza.registry import PlanOutcome, Registry, TaskSpec
 
 
@@ -281,3 +294,114 @@ async def test_crash_between_claim_and_commit_rolls_back_and_is_resumable(sessio
         run = await session.get(WorkflowRun, run_id)
     assert run.status == RunStatus.completed.value
     assert calls["n"] == 2
+
+
+async def test_lease_claim_releases_row_lock_before_handler_finishes(session_factory):
+    """The whole point of the lease model: unlike process_one, the claim
+    transaction commits (and releases its row lock) before the handler is
+    even called, instead of holding the lock for however long the handler
+    takes. Proven by grabbing the same row with FOR UPDATE NOWAIT - which
+    raises immediately instead of blocking - while the handler is still
+    sitting there, deliberately paused."""
+    reg = Registry()
+    handler_started = asyncio.Event()
+    release_handler = asyncio.Event()
+
+    async def slow_handler(ctx):
+        handler_started.set()
+        await release_handler.wait()
+        return {"ok": True}
+
+    async def plan_next(input):
+        return PlanOutcome(run_complete=True)
+
+    reg.agent("slow", plan_next=plan_next)(slow_handler)
+
+    run_id = await start_run(session_factory, "slow lease task", TaskSpec(type="slow"))
+
+    task_future = asyncio.ensure_future(process_one_with_lease(session_factory, reg, run_id))
+    try:
+        await asyncio.wait_for(handler_started.wait(), timeout=5)
+
+        # The handler is now blocked mid-flight, on purpose. If the claim
+        # were still holding its transaction open (as process_one's would
+        # be), this FOR UPDATE NOWAIT would raise immediately for the
+        # opposite reason - a lock held by someone else. Instead the claim
+        # already committed, so a brand-new session can lock the row with
+        # no contention at all.
+        async with session_factory() as session:
+            result = await session.execute(
+                text("SELECT id, status FROM cadenza_tasks WHERE run_id = :run_id FOR UPDATE NOWAIT"),
+                {"run_id": run_id},
+            )
+            row = result.first()
+            assert row is not None
+            assert row.status == "running"
+            await session.commit()
+    finally:
+        release_handler.set()
+
+    assert await asyncio.wait_for(task_future, timeout=5)
+
+    async with session_factory() as session:
+        run = await session.get(WorkflowRun, run_id)
+        task = (await session.execute(select(Task).where(Task.run_id == run_id))).scalar_one()
+    assert run.status == RunStatus.completed.value
+    assert task.status == "completed"
+    assert task.lease_expires_at is None
+
+
+async def test_sweep_expired_leases_recovers_stuck_task(session_factory):
+    """A worker claims a task with a lease and then, say, crashes: nothing
+    ever runs a commit transaction for it. sweep_expired_leases must
+    notice the lease is in the past and put the task back to 'pending'
+    (attempts unchanged) so it's claimable again - by either model."""
+    reg = Registry()
+
+    async def handler(ctx):
+        return {"ok": True}
+
+    async def plan_next(input):
+        return PlanOutcome(run_complete=True)
+
+    reg.agent("leased", plan_next=plan_next)(handler)
+
+    run_id = await start_run(session_factory, "will crash after leasing", TaskSpec(type="leased"))
+
+    # Claim with a lease that's already expired - simulating a worker that
+    # claimed the task and then vanished before ever reaching the commit
+    # step.
+    task_id = await claim_with_lease(session_factory, run_id, lease_seconds=-1)
+    assert task_id is not None
+
+    async with session_factory() as session:
+        task = await session.get(Task, task_id)
+    assert task.status == "running"
+    assert task.lease_expires_at is not None
+    assert task.attempts == 1
+
+    # Sweeping too early (nothing expired yet) must be a no-op - only
+    # matters here because we've asserted the lease already is expired
+    # above; a second, unexpired task should be left alone.
+    other_task_id = await claim_with_lease(session_factory, run_id, lease_seconds=3600)
+    assert other_task_id is None  # nothing else pending yet, just documenting the call is safe
+
+    recovered = await sweep_expired_leases(session_factory, run_id)
+    assert recovered == [task_id]
+
+    async with session_factory() as session:
+        task_after = await session.get(Task, task_id)
+    assert task_after.status == "pending"
+    assert task_after.lease_expires_at is None
+    assert task_after.attempts == 1  # sweep resets status, not the attempt counter
+
+    # A crashed worker's task becomes claimable again instead of stuck
+    # forever - by the lease path here, but it would look identical to
+    # process_one too, since it's just a plain 'pending' row now.
+    reclaimed_id = await claim_with_lease(session_factory, run_id)
+    assert reclaimed_id == task_id
+
+    async with session_factory() as session:
+        task_reclaimed = await session.get(Task, task_id)
+    assert task_reclaimed.status == "running"
+    assert task_reclaimed.attempts == 2
