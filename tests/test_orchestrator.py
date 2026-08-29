@@ -351,6 +351,68 @@ async def test_lease_claim_releases_row_lock_before_handler_finishes(session_fac
     assert task.lease_expires_at is None
 
 
+async def test_report_progress_is_visible_before_the_task_settles(session_factory):
+    """ctx.report_progress must commit independently of the task's own
+    held-open transaction (process_one holds one for the handler's entire
+    duration) - proven by pausing the handler mid-flight, calling
+    report_progress, and reading the event back from a separate session
+    while the claim itself is still uncommitted."""
+    reg = Registry()
+    handler_started = asyncio.Event()
+    release_handler = asyncio.Event()
+
+    async def slow_handler(ctx):
+        handler_started.set()
+        await ctx.report_progress("halfway there")
+        await release_handler.wait()
+        return {"ok": True}
+
+    async def plan_next(input):
+        return PlanOutcome(run_complete=True)
+
+    reg.agent("slow", plan_next=plan_next)(slow_handler)
+
+    run_id = await start_run(session_factory, "slow task with progress", TaskSpec(type="slow"))
+
+    task_future = asyncio.ensure_future(process_one(session_factory, reg, run_id))
+    try:
+        await asyncio.wait_for(handler_started.wait(), timeout=5)
+
+        # report_progress is a separate commit, not synchronized with
+        # handler_started - poll briefly rather than assuming it has
+        # already landed by the time we get here.
+        row = None
+        for _ in range(50):
+            async with session_factory() as session:
+                result = await session.execute(
+                    text("SELECT payload FROM cadenza_events WHERE run_id = :run_id AND type = 'task_progress'"),
+                    {"run_id": run_id},
+                )
+                row = result.first()
+            if row is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert row is not None
+        assert row.payload["message"] == "halfway there"
+
+        # The claim's own UPDATE is still sitting inside process_one's open
+        # transaction, uncommitted - a separate session reading under READ
+        # COMMITTED still sees the pre-claim 'pending' state. The progress
+        # event landed anyway: exactly the point of routing it through its
+        # own short transaction instead of the handler's.
+        async with session_factory() as session:
+            task = (await session.execute(select(Task).where(Task.run_id == run_id))).scalar_one()
+        assert task.status == "pending"
+    finally:
+        release_handler.set()
+
+    assert await asyncio.wait_for(task_future, timeout=5)
+
+    async with session_factory() as session:
+        run = await session.get(WorkflowRun, run_id)
+    assert run.status == RunStatus.completed.value
+
+
 async def test_sweep_expired_leases_recovers_stuck_task(session_factory):
     """A worker claims a task with a lease and then, say, crashes: nothing
     ever runs a commit transaction for it. sweep_expired_leases must

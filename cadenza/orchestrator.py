@@ -29,6 +29,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Awaitable, Callable
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -115,6 +116,28 @@ async def _claim(session: AsyncSession, run_id: int) -> Task | None:
     if row is None:
         return None
     return await session.get(Task, row.id)
+
+
+def _progress_reporter(
+    session_factory: async_sessionmaker[AsyncSession], run_id: int, task_id: int
+) -> Callable[[str], Awaitable[None]]:
+    """Bound to one task. Each call opens its own short transaction and
+    commits immediately - deliberately outside the transaction the calling
+    handler is running inside (held open for process_one's duration, or not
+    open at all for the lease path's handler phase) - so a still-running
+    task's progress becomes visible to a concurrent reader (a dashboard
+    polling GET /runs/{id}/trace) right away, instead of waiting for the
+    task to settle. Best-effort and informational only: if the task's own
+    transaction later rolls back (a crash, an unhandled bug), these rows
+    are not undone - they're a live trace, not part of the state machine,
+    exactly like task_progress events from a task that later fails."""
+
+    async def report(message: str) -> None:
+        async with session_factory() as session:
+            session.add(Event(run_id=run_id, task_id=task_id, type="task_progress", payload={"message": message}))
+            await session.commit()
+
+    return report
 
 
 async def _block_dependents(session: AsyncSession, run_id: int, task_id: int, reason: str) -> None:
@@ -302,7 +325,13 @@ async def process_one(
 
         run = await session.get(WorkflowRun, run_id)
         spec = registry.get(task.type)
-        ctx = AgentContext(run_id=run_id, task_id=task.id, input=task.input, run_context=run.context)
+        ctx = AgentContext(
+            run_id=run_id,
+            task_id=task.id,
+            input=task.input,
+            run_context=run.context,
+            report_progress=_progress_reporter(session_factory, run_id, task.id),
+        )
 
         try:
             output = await spec.handler(ctx)
@@ -496,7 +525,13 @@ async def process_one_with_lease(
         task = await session.get(Task, task_id)
         run = await session.get(WorkflowRun, run_id)
         spec = registry.get(task.type)
-        ctx = AgentContext(run_id=run_id, task_id=task.id, input=task.input, run_context=run.context)
+        ctx = AgentContext(
+            run_id=run_id,
+            task_id=task.id,
+            input=task.input,
+            run_context=run.context,
+            report_progress=_progress_reporter(session_factory, run_id, task.id),
+        )
 
     # No transaction (and no lock) held here, however long the handler
     # takes - the entire point of this model.

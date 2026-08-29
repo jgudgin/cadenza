@@ -149,12 +149,28 @@ class Event(Base):
     """
 
     __tablename__ = "cadenza_events"
-    # GET /runs/{id}/trace and `cadenza trace` both do exactly this lookup.
-    __table_args__ = (Index("ix_cadenza_events_run_id", "run_id"),)
+    __table_args__ = (
+        # GET /runs/{id}/trace and `cadenza trace` both do exactly this
+        # lookup.
+        Index("ix_cadenza_events_run_id", "run_id"),
+        Index("ix_cadenza_events_task_id", "task_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("cadenza_runs.id"))
-    task_id: Mapped[int | None] = mapped_column(ForeignKey("cadenza_tasks.id"), nullable=True)
+    # Deliberately no ForeignKey here, unlike every other id column in this
+    # file: AgentContext.report_progress (orchestrator.py::_progress_reporter)
+    # writes an Event from a second, concurrent connection while the task's
+    # own row is still held under process_one's open transaction. A foreign
+    # key check needs a FOR KEY SHARE lock on the referenced task row, which
+    # conflicts with the FOR NO KEY UPDATE the claim's UPDATE is still
+    # holding - so a real FK here self-deadlocks the moment a handler calls
+    # report_progress on itself (the handler's own transaction can't
+    # proceed until report_progress's INSERT returns, and that INSERT can't
+    # proceed until the handler's transaction commits). Nothing ever
+    # deletes a Task, so there's no real integrity this constraint would
+    # have protected anyway - just indexed instead.
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     type: Mapped[str] = mapped_column(String(50))
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

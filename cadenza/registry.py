@@ -23,6 +23,12 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 
 
+async def _default_report_progress(message: str) -> None:
+    """The no-op AgentContext falls back to when nothing wires a real one
+    in (constructing AgentContext directly, e.g. in a test) - so calling
+    ctx.report_progress never requires a caller to stub it out."""
+
+
 @dataclass
 class AgentContext:
     """What an agent handler is handed to do its job."""
@@ -31,6 +37,16 @@ class AgentContext:
     task_id: int
     input: dict[str, Any]
     run_context: dict[str, Any]  # the run's shared blackboard, read-only here
+    # Best-effort, informational only - not part of the state machine. A
+    # long-running handler (cadenza-self-maintain's coding loop is the
+    # motivating case: up to 20 LLM tool-call turns inside one task) can
+    # call this to narrate what it's doing right now. Each call is its own
+    # short transaction, committed immediately and independently of
+    # whatever transaction the handler itself is running inside - see
+    # orchestrator.py's _progress_reporter for why that matters: it's what
+    # makes a still-running task's progress visible to a live reader (a
+    # dashboard) instead of waiting for the task to settle.
+    report_progress: Callable[[str], Awaitable[None]] = _default_report_progress
 
 
 AgentHandler = Callable[[AgentContext], Awaitable[dict[str, Any]]]
