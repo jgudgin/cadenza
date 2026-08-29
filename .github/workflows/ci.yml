@@ -14,7 +14,7 @@ jobs:
     # NOT EXISTS check, the jsonb `||` merge under real concurrency).
     services:
       postgres:
-        image: postgres:16
+        image: postgres:18
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: cadenza
@@ -31,7 +31,7 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://postgres:cadenza@localhost:5432/cadenza
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v5
         with:

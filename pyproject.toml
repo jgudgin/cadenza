@@ -18,11 +18,14 @@ dependencies = [
 # opinion on what model, if any, makes planning decisions. A project that
 # uses cadenza.llm.decide_next_steps needs this extra; one that only uses
 # rule planners never touches Anthropic at all.
-anthropic = ["anthropic>=0.40"]
+anthropic = ["anthropic>=1.0"]
+# Includes the anthropic extra so CI actually imports and exercises
+# cadenza.llm (tests/test_llm.py) instead of that module going untested.
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
+    "cadenza[anthropic]",
 ]
 
 [build-system]

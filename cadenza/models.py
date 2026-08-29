@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -66,6 +67,12 @@ class WorkflowRun(Base):
 
 class Task(Base):
     __tablename__ = "cadenza_tasks"
+    # Postgres does not auto-index foreign key columns - only the primary
+    # key gets one for free. This composite is what the claim query
+    # (orchestrator.py::_NEXT_TASK_CTE, filtering run_id + status='pending')
+    # and every status-scoped listing actually hit; without it those become
+    # sequential scans as a run's task count grows.
+    __table_args__ = (Index("ix_cadenza_tasks_run_id_status", "run_id", "status"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("cadenza_runs.id"))
@@ -116,7 +123,15 @@ class TaskDependency(Base):
     """
 
     __tablename__ = "cadenza_task_dependencies"
-    __table_args__ = (UniqueConstraint("task_id", "depends_on_task_id"),)
+    __table_args__ = (
+        UniqueConstraint("task_id", "depends_on_task_id"),
+        # The unique constraint above indexes (task_id, depends_on_task_id)
+        # with task_id leading, which covers the readiness check
+        # (`WHERE d.task_id = t.id`) but not _block_dependents' reverse
+        # lookup (`WHERE d.depends_on_task_id = ANY(:ids)`) - that needs its
+        # own index or it's a sequential scan every time a task fails.
+        Index("ix_cadenza_task_dependencies_depends_on_task_id", "depends_on_task_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("cadenza_tasks.id"))
@@ -134,6 +149,8 @@ class Event(Base):
     """
 
     __tablename__ = "cadenza_events"
+    # GET /runs/{id}/trace and `cadenza trace` both do exactly this lookup.
+    __table_args__ = (Index("ix_cadenza_events_run_id", "run_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("cadenza_runs.id"))

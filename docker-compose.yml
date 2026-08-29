@@ -1,6 +1,6 @@
 services:
   cadenza-db:
-    image: postgres:16
+    image: postgres:18
     container_name: cadenza-db
     environment:
       POSTGRES_USER: postgres
@@ -9,7 +9,9 @@ services:
     ports:
       - "5434:5432"
     volumes:
-      - cadenza-db-data:/var/lib/postgresql/data
+      # postgres:18+ moved the default data directory under the version-
+      # specific /var/lib/postgresql (was .../data on 16/17).
+      - cadenza-db-data:/var/lib/postgresql
 
 volumes:
   cadenza-db-data:
