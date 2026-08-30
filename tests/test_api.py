@@ -72,3 +72,57 @@ async def test_get_run_tasks_includes_output_for_a_completed_task(session_factor
 async def test_get_run_returns_404_for_an_unknown_run(client):
     resp = await client.get("/runs/999999")
     assert resp.status_code == 404
+
+
+async def test_get_run_tasks_includes_dependency_edges_for_a_fan_out_plan(session_factory, engine):
+    """The dashboard's dependency graph needs depends_on edges, not just
+    created_by_task_id lineage - same fan-out/join shape as
+    test_orchestrator.py::test_fan_out_fan_in_completes, but asserting on
+    the HTTP response instead of the ORM rows. Uses its own registry/app,
+    since the module-level `client` fixture is wired to the module-level
+    `registry` fixture, which only knows `do_thing`."""
+    reg = Registry()
+
+    async def start(ctx):
+        return {"started": True}
+
+    async def plan_start(input):  # noqa: ANN001
+        return PlanOutcome(
+            tasks=[
+                TaskSpec(type="leg", input={"name": "a"}, key="a"),
+                TaskSpec(type="leg", input={"name": "b"}, key="b"),
+                TaskSpec(type="join", depends_on=["a", "b"]),
+            ]
+        )
+
+    reg.agent("start", plan_next=plan_start)(start)
+
+    async def leg(ctx):
+        return {"name": ctx.input["name"]}
+
+    async def plan_leg(input):  # noqa: ANN001
+        return PlanOutcome()
+
+    reg.agent("leg", plan_next=plan_leg)(leg)
+
+    async def join(ctx):
+        return {"joined": True}
+
+    async def plan_join(input):  # noqa: ANN001
+        return PlanOutcome(run_complete=True)
+
+    reg.agent("join", plan_next=plan_join)(join)
+
+    run_id = await start_run(session_factory, "fan out and back in", TaskSpec(type="start"))
+    await run_to_completion(session_factory, reg, run_id, concurrency=3, poll_interval=0.05)
+
+    app = create_app(reg, engine=engine)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/runs/{run_id}/tasks")
+
+    assert resp.status_code == 200
+    tasks = resp.json()
+    leg_ids = sorted(t["id"] for t in tasks if t["type"] == "leg")
+    join_task = next(t for t in tasks if t["type"] == "join")
+    assert sorted(join_task["depends_on"]) == leg_ids
+    assert all(t["depends_on"] == [] for t in tasks if t["type"] == "leg")
