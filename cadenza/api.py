@@ -15,9 +15,10 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.orm import selectinload
 
 from . import db
-from .models import Event, Task, TaskDependency, WorkflowRun
+from .models import Event, Task, WorkflowRun
 from .orchestrator import run_to_completion, start_run
 from .registry import Registry, TaskSpec
 
@@ -98,22 +99,13 @@ def create_app(registry: Registry, *, title: str = "cadenza", engine: AsyncEngin
     @app.get("/runs/{run_id}/tasks")
     async def get_tasks(run_id: int) -> list[dict]:
         async with session_factory() as session:
-            result = await session.execute(select(Task).where(Task.run_id == run_id).order_by(Task.id))
-            tasks = result.scalars().all()
-            # A task's depends_on edges (cadenza_task_dependencies), not
-            # just its created_by_task_id lineage - a dashboard wanting to
-            # draw the actual dependency graph needs both directions and
-            # this table is the only source of the former. Joined against
-            # Task and scoped to run_id rather than filtering by a
-            # pre-materialized id list, in one round trip.
-            dep_result = await session.execute(
-                select(TaskDependency.task_id, TaskDependency.depends_on_task_id)
-                .join(Task, Task.id == TaskDependency.task_id)
+            result = await session.execute(
+                select(Task)
                 .where(Task.run_id == run_id)
+                .options(selectinload(Task.dependencies))
+                .order_by(Task.id)
             )
-            depends_on: dict[int, list[int]] = {}
-            for task_id, dep_id in dep_result.all():
-                depends_on.setdefault(task_id, []).append(dep_id)
+            tasks = result.scalars().all()
         return [
             {
                 "id": t.id,
@@ -122,11 +114,9 @@ def create_app(registry: Registry, *, title: str = "cadenza", engine: AsyncEngin
                 "attempts": t.attempts,
                 "created_by_task_id": t.created_by_task_id,
                 "last_error": t.last_error,
-                # output carries whatever an agent handler returned - a PR
-                # link, a summary, a diagnosis - the "what actually
-                # happened" a dashboard shows per task, not just its status.
+                # An agent handler's return value shows up here: a PR link, a summary, or a diagnosis.
                 "output": t.output,
-                "depends_on": depends_on.get(t.id, []),  # always a list, never null/missing
+                "depends_on": [d.depends_on_task_id for d in t.dependencies],
                 "created_at": t.created_at.isoformat(),
                 "updated_at": t.updated_at.isoformat(),
                 "lease_expires_at": t.lease_expires_at.isoformat() if t.lease_expires_at else None,

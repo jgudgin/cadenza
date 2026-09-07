@@ -75,12 +75,12 @@ async def test_get_run_returns_404_for_an_unknown_run(client):
 
 
 async def test_get_run_tasks_includes_dependency_edges_for_a_fan_out_plan(session_factory, engine):
-    """The dashboard's dependency graph needs depends_on edges, not just
-    created_by_task_id lineage - same fan-out/join shape as
-    test_orchestrator.py::test_fan_out_fan_in_completes, but asserting on
-    the HTTP response instead of the ORM rows. Uses its own registry/app,
-    since the module-level `client` fixture is wired to the module-level
-    `registry` fixture, which only knows `do_thing`."""
+    """Checks the same fan-out/join shape as
+    test_orchestrator.py::test_fan_out_fan_in_completes, this time
+    asserting on the HTTP response instead of the ORM rows. It builds its
+    own registry and app because the module-level `client` fixture is
+    wired to the module-level `registry` fixture, which only knows
+    `do_thing`."""
     reg = Registry()
 
     async def start(ctx):
