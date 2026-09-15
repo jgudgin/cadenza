@@ -263,43 +263,9 @@ async def _settle_task(
     fresh one opened after the handler already returned)."""
     run_id = run.id
 
-    if outcome_kind == "drop":
-        task.status = TaskStatus.dropped.value
-        task.last_error = str(error)
-        session.add(Event(run_id=run_id, task_id=task.id, type="task_dropped", payload={"reason": str(error)}))
-        await _block_dependents(session, run_id, task.id, f"upstream task dropped: {error}")
+    if outcome_kind != "completed":
+        await _settle_failure(session, run_id, task, spec, outcome_kind=outcome_kind, error=error)
         return
-
-    if outcome_kind == "permanent":
-        task.status = TaskStatus.failed.value
-        task.last_error = str(error)
-        session.add(
-            Event(run_id=run_id, task_id=task.id, type="task_failed", payload={"reason": str(error), "permanent": True})
-        )
-        await _block_dependents(session, run_id, task.id, f"upstream task failed: {error}")
-        return
-
-    if outcome_kind == "retry":  # Retry, or anything unexpected - same treatment
-        if task.attempts >= spec.max_attempts:
-            task.status = TaskStatus.failed.value
-            task.last_error = f"gave up after {task.attempts} attempts: {error}"
-            log.warning("task %s (%s) gave up after %s attempts: %s", task.id, task.type, task.attempts, error)
-            session.add(
-                Event(run_id=run_id, task_id=task.id, type="task_failed", payload={"reason": str(error), "attempts": task.attempts})
-            )
-            await _block_dependents(session, run_id, task.id, f"upstream task exhausted retries: {error}")
-        else:
-            task.status = TaskStatus.pending.value
-            task.last_error = str(error)
-            task.next_attempt_at = backoff(task.attempts)
-            session.add(
-                Event(run_id=run_id, task_id=task.id, type="task_retry", payload={"reason": str(error), "attempt": task.attempts})
-            )
-        return
-
-    task.status = TaskStatus.completed.value
-    task.output = output
-    session.add(Event(run_id=run_id, task_id=task.id, type="task_completed", payload={"output": output}))
 
     planner_input = PlannerInputData(
         goal=run.goal,
@@ -309,8 +275,99 @@ async def _settle_task(
         output=output,
         task_id=task.id,
     )
-    outcome = await spec.plan_next(planner_input)
-    await _apply_plan(session, run, task, outcome)
+
+    # TODO comment needed: why planning runs inside a savepoint instead of directly in the claim's transaction
+    try:
+        async with session.begin_nested():
+            task.status = TaskStatus.completed.value
+            task.output = output
+            session.add(Event(run_id=run_id, task_id=task.id, type="task_completed", payload={"output": output}))
+            outcome = await spec.plan_next(planner_input)
+            await _apply_plan(session, run, task, outcome)
+    except Drop as exc:
+        # TODO comment needed: why the task must be refreshed after the savepoint rolls back
+        await session.refresh(task)
+        await _settle_failure(
+            session, run_id, task, spec, outcome_kind="drop", error=exc, phase="plan", discarded_output=output
+        )
+    except Permanent as exc:
+        await session.refresh(task)
+        await _settle_failure(
+            session, run_id, task, spec, outcome_kind="permanent", error=exc, phase="plan", discarded_output=output
+        )
+    except Exception as exc:
+        await session.refresh(task)
+        await _settle_failure(
+            session, run_id, task, spec, outcome_kind="retry", error=exc, phase="plan", discarded_output=output
+        )
+
+
+# TODO comment needed: why failures during planning record the phase and the discarded handler output
+async def _settle_failure(
+    session: AsyncSession,
+    run_id: int,
+    task: Task,
+    spec: AgentSpec | None,
+    *,
+    outcome_kind: str,
+    error: Exception,
+    phase: str | None = None,
+    discarded_output: dict | None = None,
+) -> None:
+    extra: dict = {}
+    if phase is not None:
+        extra["phase"] = phase
+        extra["discarded_output"] = discarded_output
+
+    if outcome_kind == "drop":
+        task.status = TaskStatus.dropped.value
+        task.last_error = str(error)
+        session.add(
+            Event(run_id=run_id, task_id=task.id, type="task_dropped", payload={"reason": str(error), **extra})
+        )
+        await _block_dependents(session, run_id, task.id, f"upstream task dropped: {error}")
+        return
+
+    if outcome_kind == "permanent":
+        task.status = TaskStatus.failed.value
+        task.last_error = str(error)
+        session.add(
+            Event(
+                run_id=run_id,
+                task_id=task.id,
+                type="task_failed",
+                payload={"reason": str(error), "permanent": True, **extra},
+            )
+        )
+        await _block_dependents(session, run_id, task.id, f"upstream task failed: {error}")
+        return
+
+    # Retry, or anything unexpected - same treatment
+    if task.attempts >= spec.max_attempts:
+        task.status = TaskStatus.failed.value
+        task.last_error = f"gave up after {task.attempts} attempts: {error}"
+        log.warning("task %s (%s) gave up after %s attempts: %s", task.id, task.type, task.attempts, error)
+        session.add(
+            Event(
+                run_id=run_id,
+                task_id=task.id,
+                type="task_failed",
+                payload={"reason": str(error), "attempts": task.attempts, **extra},
+            )
+        )
+        await _block_dependents(session, run_id, task.id, f"upstream task exhausted retries: {error}")
+    else:
+        task.status = TaskStatus.pending.value
+        task.last_error = str(error)
+        task.next_attempt_at = backoff(task.attempts)
+        session.add(
+            Event(
+                run_id=run_id,
+                task_id=task.id,
+                type="task_retry",
+                payload={"reason": str(error), "attempt": task.attempts, **extra},
+            )
+        )
 
 
 async def process_one(
@@ -324,7 +381,13 @@ async def process_one(
             return False
 
         run = await session.get(WorkflowRun, run_id)
-        spec = registry.get(task.type)
+        # TODO comment needed: why a task with an unregistered type fails permanently instead of retrying
+        try:
+            spec = registry.get(task.type)
+        except KeyError as exc:
+            await _settle_failure(session, run_id, task, None, outcome_kind="permanent", error=exc)
+            await session.commit()
+            return True
         ctx = AgentContext(
             run_id=run_id,
             task_id=task.id,
@@ -524,7 +587,14 @@ async def process_one_with_lease(
     async with session_factory() as session:
         task = await session.get(Task, task_id)
         run = await session.get(WorkflowRun, run_id)
-        spec = registry.get(task.type)
+        try:
+            spec = registry.get(task.type)
+        except KeyError as exc:
+            # TODO comment needed: why the lease is cleared when an unregistered type fails on the lease path
+            task.lease_expires_at = None
+            await _settle_failure(session, run_id, task, None, outcome_kind="permanent", error=exc)
+            await session.commit()
+            return True
         ctx = AgentContext(
             run_id=run_id,
             task_id=task.id,

@@ -20,6 +20,8 @@ These are synthetic agents, not the finance ones: no ANTHROPIC_API_KEY
 needed, and each test isolates exactly one engine behaviour.
 """
 
+# TODO comment needed: the docstring's crash bullet says a planner bug counts as a crash; planner failures now retry, and cancellation is the crash case
+
 from __future__ import annotations
 
 import asyncio
@@ -255,44 +257,51 @@ async def test_dropped_task_blocks_dependents(session_factory):
 
 
 async def test_crash_between_claim_and_commit_rolls_back_and_is_resumable(session_factory):
-    """The central claim of this whole design: a task, one transaction.
-    A bug in the planner itself - not a handled Retry/Permanent/Drop, a
-    genuine unhandled exception - must not leave the task half-claimed.
-    """
+    # TODO comment needed: why cancelling the worker stands in for a crashed process, and why a planner exception no longer does
     reg = Registry()
     calls = {"n": 0}
+    handler_started = asyncio.Event()
+    never_released = asyncio.Event()
 
-    async def unstable(ctx):
-        return {"value": 42}
-
-    async def buggy_plan(input):
+    async def slow(ctx):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise RuntimeError("simulated bug - not Retry/Permanent/Drop")
-        return PlanOutcome(reasoning="fixed on the next attempt", run_complete=True)
+            handler_started.set()
+            await never_released.wait()
+        return {"call": calls["n"]}
 
-    reg.agent("unstable", plan_next=buggy_plan)(unstable)
+    async def plan_slow(input):
+        return PlanOutcome(run_complete=True)
 
-    run_id = await start_run(session_factory, "will crash once", TaskSpec(type="unstable"))
+    reg.agent("slow", plan_next=plan_slow)(slow)
 
-    with pytest.raises(RuntimeError):
-        await process_one(session_factory, reg, run_id)
+    run_id = await start_run(session_factory, "worker dies mid-handler", TaskSpec(type="slow"))
 
+    worker = asyncio.ensure_future(process_one(session_factory, reg, run_id))
+    await asyncio.wait_for(handler_started.wait(), timeout=5)
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    # TODO comment needed: why FOR UPDATE NOWAIT succeeding proves the claim's transaction rolled back
     async with session_factory() as session:
-        task = (await session.execute(select(Task).where(Task.run_id == run_id))).scalar_one()
-    # Everything the crashed transaction did - including the claim's own
-    # status flip and attempts increment - rolled back. Nothing was
-    # half-applied; a fresh worker sees exactly what it would have seen if
-    # this had never been attempted.
-    assert task.status == "pending"
-    assert task.output is None
-    assert task.attempts == 0
+        result = await session.execute(
+            text("SELECT status, attempts, output FROM cadenza_tasks WHERE run_id = :run_id FOR UPDATE NOWAIT"),
+            {"run_id": run_id},
+        )
+        row = result.one()
+        await session.rollback()
+    assert row.status == "pending"
+    assert row.attempts == 0
+    assert row.output is None
 
     assert await process_one(session_factory, reg, run_id)
 
     async with session_factory() as session:
         run = await session.get(WorkflowRun, run_id)
+        task = (await session.execute(select(Task).where(Task.run_id == run_id))).scalar_one()
     assert run.status == RunStatus.completed.value
+    assert task.attempts == 1
     assert calls["n"] == 2
 
 
